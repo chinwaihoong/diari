@@ -746,6 +746,8 @@ function openSettings() {
         : '<p class="muted">In Chrome, open the ⋮ menu and tap <b>Install app</b> (or <b>Add to Home screen</b>). On a PC, click the install icon at the right of the address bar.</p>')) +
     '<h3>Fix the list</h3><p class="muted">If you edit, move or delete entry files in Google Drive yourself, rebuild the list from the files.</p>' +
     '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
+    '<h3>Earlier journal</h3><p class="muted">Diari only sees files it created. To bring in entries from the earlier version of Diari, it asks once for access to your whole Drive, copies them in, then gives that access up.</p>' +
+    '<button class="btn ghost" id="btn-move">Bring in an earlier journal</button>' +
     '<h3>Account</h3><p>' + (Auth.email ? 'Signed in as <b>' + esc(Auth.email) + '</b>' : 'Signed in with Google') + '</p>' +
     '<button class="btn ghost" id="btn-signout">Sign out on this device</button>' +
     '<h3>Videos</h3><p class="muted">Short clips start almost at once. Long videos download first, so they take a moment. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>';
@@ -788,6 +790,11 @@ function openSettings() {
       toast('Rebuilt: ' + plural(S.entries.length, 'entry', 'entries'));
     }).catch(fail)
       .then(function () { b.disabled = false; b.textContent = 'Rebuild from Drive files'; });
+  };
+  $('#btn-move', box).onclick = function () {
+    confirmDlg({ title: 'Bring in an earlier journal?', text: 'Google will ask for access to your whole Drive, just for this. Diari copies the entries in, renames the old Journal folder to “Journal - old copy”, then gives that access up.', ok: 'Continue' }).then(function (yes) {
+      if (yes) Auth.signIn(false, 'move');
+    });
   };
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
@@ -1143,6 +1150,13 @@ function wireShell() {
     if (t.closest('[data-install]')) { Install.prompt(); return; }
     if (t.closest('[data-install-hide]')) { lsSet('diari-install-hidden', 1); render(); return; }
     if (t.closest('[data-signin]')) { Auth.signIn(false); return; }
+    if (t.closest('[data-move]')) { if (Auth.full && Auth.valid(10 * 60e3)) runMove(); else Auth.signIn(false, 'move'); return; }
+    var fr = t.closest('[data-fresh]');
+    if (fr) {
+      fr.disabled = true; fr.textContent = 'Setting up…';
+      API.createJournal().then(boot).catch(function (err) { fr.disabled = false; fr.textContent = 'Start a new journal'; fail(err); });
+      return;
+    }
   });
 
   window.addEventListener('scroll', function () { $('#top').classList.toggle('scrolled', window.scrollY > 4); }, { passive: true });
@@ -1159,19 +1173,64 @@ function bootError(err) {
 
 var AUTH_ERRORS = {
   access_denied: 'You chose not to allow access. Diari needs your Google Drive to save your journal.',
-  drive_not_granted: 'Diari needs permission to use your Google Drive. Sign in again and tick the Google Drive box.',
+  drive_not_granted: 'Diari needs permission to save files in your Google Drive. Sign in again and allow it.',
+  full_not_granted: 'To move your earlier journal, allow access to your whole Google Drive when Google asks. Diari gives it up again as soon as the move is done.',
   interaction_required: '', login_required: '', consent_required: ''
 };
+var MARK = '<img class="signin-mark" src="icons/icon-192.png" alt="" width="84" height="84">';
+
+function fullScreen(html) {
+  $('#fab').hidden = true;
+  document.body.classList.add('signed-out');
+  view.innerHTML = '<div class="signin">' + MARK + html + '</div>';
+}
+
+/** First run on this Google account: move an earlier journal in, or start a new one. */
+function showSetup(resume, msg) {
+  fullScreen(resume
+    ? '<h2>Finish moving your journal</h2>' +
+      '<p>Moving your earlier journal stopped before it finished. Continue now; entries already moved are not copied twice.</p>' +
+      (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
+      '<button class="btn primary" data-move>Continue moving</button>'
+    : '<h2>Set up your journal</h2>' +
+      '<p>Diari only sees the files it creates in your Google Drive, never anything else.</p>' +
+      (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
+      '<button class="btn primary" data-move>Move my earlier journal</button>' +
+      '<p class="signin-note">If you used Diari before: Google asks once for access to your whole Drive. Diari copies your entries, photos and videos into a new Journal folder, renames the old one to “Journal - old copy”, then gives that access up. Delete the old copy when you have checked everything, so it doesn’t take up space twice.</p>' +
+      '<button class="btn ghost" data-fresh>Start a new journal</button>');
+}
+
+/** Runs right after Google gave full Drive access for the move. */
+function runMove() {
+  fullScreen('<h2>Moving your journal…</h2><p id="move-prog">Looking for your earlier journal…</p><p class="signin-note">Keep Diari open until this finishes.</p>');
+  API.moveEarlier(function (n, total) {
+    var p = $('#move-prog');
+    if (p) p.textContent = total ? 'Copied ' + n + ' of ' + plural(total, 'entry', 'entries') : 'No entries to move.';
+  }).then(function (r) {
+    return Auth.revoke().then(function () {
+      fullScreen('<h2>' + (r.none ? 'No earlier journal found' : 'Your journal is moved') + '</h2>' +
+        '<p>' + (r.none ? (r.existed ? 'Your journal is unchanged.' : 'Diari started a new Journal folder for you.')
+          : plural(r.count, 'entry is', 'entries are') + ' in your new Journal folder. The old folder is now called “Journal - old copy”. Delete it in Google Drive once you have checked that everything is here.') + '</p>' +
+        '<p>Diari has given up access to the rest of your Drive. Sign in once more to finish.</p>' +
+        '<button class="btn primary" data-signin>' + I.google + 'Sign in to finish</button>');
+    });
+  }).catch(function (err) {
+    if (err && err.expired) { Auth.signIn(false, 'move'); return; }
+    fullScreen('<h2>The move stopped</h2><p class="signin-err">' + esc(errText(err)) + '</p>' +
+      '<p>Nothing is lost. Entries already moved stay moved, and the rest continue when you try again.</p>' +
+      '<button class="btn primary" data-move>Try again</button>');
+  });
+}
 
 function showSignIn(msg) {
   $('#fab').hidden = true;
   document.body.classList.add('signed-out');
-  view.innerHTML = '<div class="signin"><img class="signin-mark" src="icons/icon-192.png" alt="" width="84" height="84">' +
+  view.innerHTML = '<div class="signin">' + MARK +
     '<h2>Your journal, kept in your Google Drive</h2>' +
-    '<p>Write about your day, add photos and videos, and find it all again by date, tag or word. Entries are saved as files in a Journal folder in your own Google Drive.</p>' +
+    '<p>Write about your day, add photos and videos, and find it all again by date, tag or word. Entries are saved as files in a Journal folder in your own Google Drive, and Diari can only see the files it creates there.</p>' +
     (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
     '<button class="btn primary" data-signin>' + I.google + 'Sign in with Google</button>' +
-    '<p class="signin-note">The first time, Google says it hasn’t verified Diari. That is expected for an app you made for yourself: tap <b>Advanced</b>, then <b>Go to Diari</b>.</p></div>';
+    '<p class="signin-note">If Google says it hasn’t verified Diari, that is expected for an app you made for yourself: tap <b>Advanced</b>, then <b>Go to Diari</b>.</p></div>';
 }
 
 function boot() {
@@ -1193,11 +1252,16 @@ function boot() {
     showSignIn(err in AUTH_ERRORS ? AUTH_ERRORS[err] : err);
     return;
   }
+  // Came back from allowing full Drive access: move the earlier journal now.
+  if (Auth.full) { runMove(); return; }
+  var authMsg = Auth.error ? (Auth.error in AUTH_ERRORS ? AUTH_ERRORS[Auth.error] : Auth.error) : '';
   $('#fab').hidden = false;
   document.body.classList.remove('signed-out');
   if (hasCache) { S.entries = normList(cached); sortEntries(); S.loaded = true; render(); }
   else view.innerHTML = '<div style="height:44px"></div>' + '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
   API.boot().then(function (r) {
+    if (r.setup || r.moveUnfinished) { showSetup(!!r.moveUnfinished, authMsg); return; }
+    if (authMsg) toast(authMsg, 7000);
     S.entries = normList(r.index.entries); sortEntries();
     S.rootUrl = /^https:\/\/drive\.google\.com\//.test(r.rootUrl || '') ? r.rootUrl : ''; S.aiTitles = r.aiTitles || ''; S.loaded = true; cacheIndex(); render();
     var re = lsGet('diari-reopen');

@@ -12,7 +12,12 @@
 'use strict';
 
 var CONFIG = window.DIARI_CONFIG || {};
-var SCOPE = 'https://www.googleapis.com/auth/drive';
+// Normal use: only files Diari created itself. Full Drive access is asked for once, only to move an
+// earlier journal in, and is given up again as soon as the move is done.
+var SCOPE_FILE = 'https://www.googleapis.com/auth/drive.file';
+var SCOPE_FULL = 'https://www.googleapis.com/auth/drive';
+var ROOT_MARK = 'Diari journal';                 // description on the Journal folder Diari created
+var MOVE_NAME = 'diari-move.json', OLD_NAME = 'Journal - old copy';
 var DRIVE = 'https://www.googleapis.com/drive/v3';
 var UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
 var FOLDER = 'application/vnd.google-apps.folder';
@@ -31,12 +36,12 @@ function rnd(n) { var a = new Uint8Array(n || 16); crypto.getRandomValues(a); re
 /* Google sign-in (redirect, so it works in the installed app)      */
 /* ================================================================ */
 var Auth = {
-  token: '', exp: 0, email: '', error: '',
+  token: '', exp: 0, email: '', error: '', full: false, purpose: '',
 
   /** Reads a sign-in result from the address, or the saved one. Call once at start. */
   init: function () {
     var saved = lsGet('diari-auth') || {};
-    this.token = saved.token || ''; this.exp = saved.exp || 0; this.email = lsGet('diari-email') || '';
+    this.token = saved.token || ''; this.exp = saved.exp || 0; this.full = !!saved.full; this.email = lsGet('diari-email') || '';
     var h = location.hash.charAt(0) === '#' ? location.hash.slice(1) : '';
     if (!/(^|&)(access_token|error)=/.test(h)) return;
     var p = new URLSearchParams(h), pending = lsGet('diari-auth-state') || {};
@@ -48,39 +53,49 @@ var Auth = {
     }
     if (p.get('error')) { this.error = p.get('error'); this.silentFailed = !!pending.silent; return; }
     var granted = (p.get('scope') || '').split(' ');
-    if (granted.indexOf(SCOPE) < 0) { this.error = 'drive_not_granted'; return; }
+    var full = granted.indexOf(SCOPE_FULL) >= 0;
+    if (pending.purpose === 'move' && !full) { this.error = 'full_not_granted'; return; }
+    if (!full && granted.indexOf(SCOPE_FILE) < 0) { this.error = 'drive_not_granted'; return; }
     this.token = p.get('access_token');
     this.exp = Date.now() + (Number(p.get('expires_in')) || 3600) * 1000;
-    lsSet('diari-auth', { token: this.token, exp: this.exp });
+    this.full = full;
+    this.purpose = pending.purpose || '';
+    lsSet('diari-auth', { token: this.token, exp: this.exp, full: full });
   },
 
   valid: function (marginMs) { return !!this.token && this.exp - Date.now() > (marginMs || 0); },
 
-  /** Leaves the app for Google's sign-in page and comes back. silent: no screens if already allowed. */
-  signIn: function (silent) {
+  /** Leaves the app for Google's sign-in page and comes back. silent: no screens if already allowed.
+      purpose 'move': asks for full Drive access, only to move an earlier journal in. */
+  signIn: function (silent, purpose) {
     if (!CONFIG.clientId) throw new Error('The app is not set up yet: the Google client ID is missing in config.js.');
+    var move = purpose === 'move';
     var state = rnd(16);
-    lsSet('diari-auth-state', { state: state, silent: !!silent, at: Date.now() });
+    lsSet('diari-auth-state', { state: state, silent: !!silent && !move, purpose: move ? 'move' : '', at: Date.now() });
     var q = {
       client_id: CONFIG.clientId,
       redirect_uri: CONFIG.redirectUri,
       response_type: 'token',
-      scope: SCOPE,
-      include_granted_scopes: 'true',
+      scope: move ? SCOPE_FULL : SCOPE_FILE,
       state: state
     };
-    if (silent) q.prompt = 'none';
+    if (silent && !move) q.prompt = 'none';
     if (this.email) q.login_hint = this.email;
     location.assign('https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams(q).toString());
     return new Promise(function () {});        // the page is leaving
   },
 
-  signOut: function () {
+  /** Ends this sign-in and withdraws everything Diari was allowed to do in the Google account. */
+  revoke: function () {
     var t = this.token;
-    this.token = ''; this.exp = 0;
+    this.token = ''; this.exp = 0; this.full = false;
     lsDel('diari-auth');
-    if (t) fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(t), { method: 'POST' }).catch(function () {});
-  }
+    if (!t) return Promise.resolve();
+    return fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(t), { method: 'POST', mode: 'no-cors' })
+      .catch(function () {}).then(function () {});
+  },
+
+  signOut: function () { return this.revoke(); }
 };
 
 var Expired = function () { var e = new Error('Your Google sign-in has expired.'); e.expired = true; return e; };
@@ -108,7 +123,7 @@ function driveError(r) {
 
 function dj(url, opts) {
   return driveFetch(url, opts).then(function (r) {
-    if (!r.ok) return driveError(r).then(function (m) { throw new Error(m); });
+    if (!r.ok) return driveError(r).then(function (m) { var e = new Error(m); e.status = r.status; throw e; });
     return r.status === 204 ? {} : r.json();
   });
 }
@@ -198,18 +213,38 @@ function trashMedia(m) { return Promise.all([m.id, m.thumb, m.preview].map(trash
 /* ================================================================ */
 /* Journal folder, index and settings                               */
 /* ================================================================ */
+function noJournal() { var e = new Error('No journal yet.'); e.noJournal = true; return e; }
+
+/** The Journal folder Diari created (with normal access, Diari cannot see any other). */
 var rootP = null;
 function root() {
   if (rootP) return rootP;
   var saved = lsGet('diari-root');
-  var check = saved ? getMeta(saved, 'id,trashed').then(function (f) { return f.trashed ? null : f.id; }).catch(function (e) { if (e.expired) throw e; return null; }) : Promise.resolve(null);
+  var check = saved ? getMeta(saved, 'id,trashed,description').then(function (f) {
+    return !f.trashed && f.description === ROOT_MARK ? f.id : null;
+  }).catch(function (e) { if (e.expired) throw e; return null; }) : Promise.resolve(null);
   rootP = check.then(function (id) {
     if (id) return id;
-    return getMeta('root', 'id').then(function (r) { return folder(r.id, ROOT_NAME); });
-  }).then(function (id) { lsSet('diari-root', id); return id; })
-    .catch(function (e) { rootP = null; throw e; });
+    return list("'root' in parents and name = '" + ROOT_NAME + "' and mimeType = '" + FOLDER + "' and trashed = false", 'id,description')
+      .then(function (fs) {
+        var mine = fs.filter(function (f) { return f.description === ROOT_MARK; })[0];
+        return mine ? mine.id : null;
+      });
+  }).then(function (id) {
+    if (!id) throw noJournal();
+    lsSet('diari-root', id); return id;
+  }).catch(function (e) { rootP = null; throw e; });
   return rootP;
 }
+
+function createRoot() {
+  return dj(DRIVE + '/files?fields=id', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: ROOT_NAME, mimeType: FOLDER, parents: ['root'], description: ROOT_MARK })
+  }).then(function (r) { resetCaches(); lsSet('diari-root', r.id); return r.id; });
+}
+
+function resetCaches() { rootP = null; settingsP = null; folderCache = {}; targets = {}; }
 
 function readIndex(rootId) {
   return findOne(rootId, INDEX_NAME).then(function (f) {
@@ -233,6 +268,16 @@ function writeIndex(rootId, index) {
 }
 
 function rebuildIndex(rootId) {
+  return collectEntries(rootId).then(function (entries) {
+    return findOne(rootId, INDEX_NAME).then(function (f) {
+      var index = { version: 1, entries: entries, fileId: f ? f.id : '' };
+      return writeIndex(rootId, index).then(function () { return index; });
+    });
+  });
+}
+
+/** Reads every entry file in a Journal folder (year and month folders). */
+function collectEntries(rootId) {
   var isFolder = "mimeType = '" + FOLDER + "' and trashed = false";
   return list("'" + qv(rootId) + "' in parents and " + isFolder).then(function (years) {
     years = years.filter(function (y) { return /^\d{4}$/.test(y.name); });
@@ -252,11 +297,6 @@ function rebuildIndex(rootId) {
         .catch(function (e) { if (e.expired) throw e; }).then(worker);
     }
     return Promise.all([worker(), worker(), worker(), worker(), worker()]).then(function () { return out; });
-  }).then(function (entries) {
-    return findOne(rootId, INDEX_NAME).then(function (f) {
-      var index = { version: 1, entries: entries, fileId: f ? f.id : '' };
-      return writeIndex(rootId, index).then(function () { return index; });
-    });
   });
 }
 
@@ -489,6 +529,144 @@ var IDB = (function () {
 var targets = {};
 
 /* ================================================================ */
+/* Moving an earlier journal in (needs full Drive access, once)     */
+/* ================================================================ */
+function copyFile(id, name, parentId) {
+  return dj(DRIVE + '/files/' + encodeURIComponent(id) + '/copy?fields=id', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, parents: [parentId], description: MEDIA_TAG })
+  }).then(function (r) { return r.id; });
+}
+
+function moveEarlier(onProg) {
+  if (!Auth.full) return Promise.reject(new Error('Moving your earlier journal needs access to your whole Drive. Start the move again and allow it.'));
+  var q = "'root' in parents and name = '" + ROOT_NAME + "' and mimeType = '" + FOLDER + "' and trashed = false";
+  var newRoot, oldRoot, state, stateFile = '';
+  return list(q, 'id,description').then(function (fs) {
+    var mine = fs.filter(function (f) { return f.description === ROOT_MARK; });
+    var others = fs.filter(function (f) { return f.description !== ROOT_MARK; });
+    newRoot = mine.length ? mine[0].id : '';
+    var resume = newRoot ? findOne(newRoot, MOVE_NAME) : Promise.resolve(null);
+    return resume.then(function (mf) {
+      if (mf) {
+        stateFile = mf.id;
+        return readText(mf.id).then(function (t) { state = JSON.parse(t); oldRoot = state.from; });
+      }
+      // Prefer the folder that holds a journal index.
+      return Promise.all(others.map(function (f) { return findOne(f.id, INDEX_NAME).then(function (i) { return i ? f.id : null; }); }))
+        .then(function (withIndex) {
+          oldRoot = withIndex.filter(Boolean)[0] || (others[0] && others[0].id) || '';
+          state = { from: oldRoot, entries: {}, media: {} };
+        });
+    });
+  }).then(function () {
+    if (!oldRoot) {
+      var existed = !!newRoot;
+      return (newRoot ? Promise.resolve(newRoot) : createRoot()).then(function () { return { count: 0, none: true, existed: existed }; });
+    }
+    var mk = newRoot ? Promise.resolve(newRoot) : createRoot();
+    return mk.then(function (id) {
+      newRoot = id;
+      var saveState = function () {
+        var text = JSON.stringify(state);
+        if (stateFile) return updateFile(stateFile, text, {}, null, 'application/json');
+        return createFile(newRoot, MOVE_NAME, text, 'application/json').then(function (r) { stateFile = r.id; });
+      };
+      return saveState().then(function () {
+        return readIndex(oldRoot).then(function (idx) { return idx ? idx.entries : collectEntries(oldRoot); });
+      }).then(function (entries) {
+        entries.sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+        var total = entries.length, n = 0;
+        if (onProg) onProg(0, total);
+        var chain = Promise.resolve();
+        entries.forEach(function (e) {
+          chain = chain.then(function () {
+            if (state.entries[e.id]) { n++; if (onProg) onProg(n, total); return; }
+            var ymd = e.date.slice(0, 10);
+            return folder(newRoot, MEDIA_NAME).then(function (media) {
+              return Promise.all([folder(media, e.date.slice(0, 4)).then(function (y) { return folder(y, e.date.slice(5, 7)); }), folder(media, PREVIEWS_NAME)]);
+            }).then(function (dest) {
+              var media = [], mchain = Promise.resolve();
+              (e.media || []).forEach(function (m) {
+                mchain = mchain.then(function () {
+                  var copyOne = function (oldId, name, parent) {
+                    if (!oldId) return Promise.resolve('');
+                    if (state.media[oldId]) return Promise.resolve(state.media[oldId]);
+                    return copyFile(oldId, name, parent).then(function (nid) { state.media[oldId] = nid; return nid; }, function (err) {
+                      if (err.status === 404) return '';   // the file is gone from Drive; leave it out
+                      throw err;
+                    });
+                  };
+                  return copyOne(m.id, ymd + ' ' + (m.name || (m.type === 'video' ? 'video.mp4' : 'photo.jpg')), dest[0]).then(function (nid) {
+                    if (!nid) return;
+                    return Promise.all([copyOne(m.thumb, nid + '.thumb.jpg', dest[1]), copyOne(m.preview, nid + '.preview.jpg', dest[1])]).then(function (tp) {
+                      media.push(Object.assign({}, m, { id: nid, thumb: tp[0], preview: tp[1] }));
+                    });
+                  });
+                });
+              });
+              return mchain.then(function () {
+                var rec = Object.assign({}, e, { media: media });
+                delete rec.fileId;
+                return folder(newRoot, e.date.slice(0, 4)).then(function (y) { return folder(y, e.date.slice(5, 7)); }).then(function (monthId) {
+                  return createFile(monthId, fileName(rec), toMarkdown(rec));
+                }).then(function (res) {
+                  rec.fileId = res.id;
+                  state.entries[e.id] = rec;
+                  n++; if (onProg) onProg(n, total);
+                  return saveState();
+                });
+              });
+            });
+          });
+        });
+        // If something fails, remember the copies already made, so trying again doesn't copy them twice.
+        return chain.catch(function (err) {
+          return saveState().catch(function () {}).then(function () { throw err; });
+        });
+      }).then(function () {
+        // Settings (the Claude key) come along too, unless this journal already has its own.
+        return findOne(newRoot, SETTINGS_NAME).then(function (mine) {
+          if (mine) return;
+          return findOne(oldRoot, SETTINGS_NAME).then(function (f) {
+            if (!f) return;
+            return readText(f.id).then(function (t) { return createFile(newRoot, SETTINGS_NAME, t, 'application/json'); });
+          });
+        });
+      }).then(function () {
+        return readIndex(newRoot).then(function (cur) {
+          var byId = {};
+          (cur ? cur.entries : []).forEach(function (e) { byId[e.id] = e; });
+          Object.keys(state.entries).forEach(function (k) { if (!byId[k]) byId[k] = cleanStored(state.entries[k]); });
+          var index = { version: 1, entries: Object.keys(byId).map(function (k) { return byId[k]; }).filter(Boolean), fileId: cur ? cur.fileId : '' };
+          return writeIndex(newRoot, index);
+        });
+      }).then(function () {
+        return dj(DRIVE + '/files/' + encodeURIComponent(oldRoot) + '?fields=id', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: OLD_NAME })
+        });
+      }).then(function () { return trash(stateFile); })
+        .then(function () {
+          resetCaches(); lsSet('diari-root', newRoot); lsDel('diari-index');
+          return { count: Object.keys(state.entries).length };
+        });
+    });
+  });
+}
+
+function bootRoot(r) {
+  return readIndex(r).then(function (idx) { return idx || rebuildIndex(r); }).then(function (idx) {
+    return Promise.all([settings().catch(function () { return { data: {} }; }),
+      Auth.email ? null : dj(DRIVE + '/about?fields=user(emailAddress)').then(function (a) {
+        Auth.email = a.user && a.user.emailAddress || ''; lsSet('diari-email', Auth.email);
+      }).catch(function () {})
+    ]).then(function (x) {
+      return { index: { entries: idx.entries }, rootUrl: 'https://drive.google.com/drive/folders/' + r, aiTitles: x[0].data.anthropicKey ? 'Claude' : '' };
+    });
+  });
+}
+
+/* ================================================================ */
 /* What the app calls                                               */
 /* ================================================================ */
 window.DiariStore = {
@@ -497,17 +675,25 @@ window.DiariStore = {
 
   boot: function () {
     return root().then(function (r) {
-      return readIndex(r).then(function (idx) { return idx || rebuildIndex(r); }).then(function (idx) {
-        return Promise.all([settings().catch(function () { return { data: {} }; }),
-          Auth.email ? null : dj(DRIVE + '/about?fields=user(emailAddress)').then(function (a) {
-            Auth.email = a.user && a.user.emailAddress || ''; lsSet('diari-email', Auth.email);
-          }).catch(function () {})
-        ]).then(function (x) {
-          return { index: { entries: idx.entries }, rootUrl: 'https://drive.google.com/drive/folders/' + r, aiTitles: x[0].data.anthropicKey ? 'Claude' : '' };
-        });
+      return findOne(r, MOVE_NAME).then(function (mv) {
+        if (mv) return { moveUnfinished: true };
+        return bootRoot(r);
       });
+    }, function (e) {
+      if (e.noJournal) return { setup: true };
+      throw e;
     });
   },
+
+  createJournal: function () {
+    return list("'root' in parents and name = '" + ROOT_NAME + "' and mimeType = '" + FOLDER + "' and trashed = false", 'id,description').then(function (fs) {
+      var mine = fs.filter(function (f) { return f.description === ROOT_MARK; })[0];
+      if (mine) { resetCaches(); lsSet('diari-root', mine.id); return mine.id; }
+      return createRoot();
+    });
+  },
+
+  moveEarlier: moveEarlier,
 
   save: function (input) {
     var rec = cleanRec(input), note = '';
@@ -656,9 +842,9 @@ window.DiariStore = {
   },
 
   signOut: function () {
-    Auth.signOut();
+    resetCaches();
     ['diari-index', 'diari-draft', 'diari-root', 'diari-email', 'diari-reopen'].forEach(lsDel);
-    return IDB.clear();
+    return Promise.all([Auth.signOut(), IDB.clear()]);
   }
 };
 })();

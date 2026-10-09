@@ -1,6 +1,6 @@
 /* Diari offline support: keeps the app itself on the device so it opens fast and offline.
    Your journal data is never stored here; it comes from Google Drive. */
-var CACHE = 'diari-v1';
+var CACHE = 'diari-v2';
 var SHELL = ['./', 'index.html', 'app.js', 'store.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-192.png', 'icons/maskable-512.png', 'icons/icon-180.png'];
 
