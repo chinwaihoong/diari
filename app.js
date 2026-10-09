@@ -139,6 +139,78 @@ function fail(err, ms) {
   if (err && err.expired) { reauth(); return; }
   toast(errText(err), ms || 5000);
 }
+/* Background saving: an entry shows at once and is kept on this device until Google Drive has it. */
+var Outbox = {
+  items: [], busy: false, waiting: false, timer: 0, tries: 0,
+  load: function () { this.items = (lsGet('diari-outbox') || []).filter(function (x) { return x && x.rec && x.rec.id; }); },
+  persist: function () { if (this.items.length) lsSet('diari-outbox', this.items); else lsDel('diari-outbox'); },
+  has: function (id) { return this.items.some(function (x) { return x.rec.id === id; }); },
+  sending: function (id) { return this.busy && this.items[0] && this.items[0].rec.id === id; },
+  add: function (rec) {
+    var self = this;
+    var i = -1;
+    this.items.forEach(function (x, k) { if (x.rec.id === rec.id && !(k === 0 && self.busy)) i = k; });
+    if (i >= 0) this.items[i] = { rec: rec, at: Date.now() }; else this.items.push({ rec: rec, at: Date.now() });
+    this.persist(); this.run();
+  },
+  drop: function (id) {
+    var gone = null, self = this;
+    this.items = this.items.filter(function (x, k) { if (x.rec.id === id && !(k === 0 && self.busy)) { gone = x; return false; } return true; });
+    this.persist();
+    return gone;
+  },
+  /** Shows entries that are still waiting to reach Google Drive. */
+  overlay: function () {
+    this.items.forEach(function (x) { upsert(shownRec(x.rec)); });
+  },
+  run: function () {
+    var self = this;
+    clearTimeout(this.timer);
+    if (this.busy || !this.items.length) return;
+    if (!navigator.onLine) { this.waiting = true; refreshPending(); return; }
+    if (!Auth.valid(30e3)) { this.waiting = true; refreshPending(); if (!ED) reauth(); return; }
+    this.busy = true; this.waiting = false; refreshPending();
+    var item = this.items[0];
+    API.save(item.rec).then(function (saved) {
+      var note = saved._note;
+      saved = normEntry(saved);
+      self.items.shift(); self.persist(); self.busy = false; self.tries = 0;
+      if (saved && !self.has(saved.id)) upsert(saved);
+      refreshPending();
+      if (note) toast(note, 7000);
+      else if (!self.items.length) toast('Saved to Google Drive');
+      self.run();
+    }).catch(function (err) {
+      self.busy = false; self.waiting = true; refreshPending();
+      if (err && err.expired) { if (!ED) reauth(); return; }
+      self.tries++;
+      if (self.tries === 1 || self.tries % 5 === 0) toast(errText(err) + ' Diari keeps it on this device and tries again.', 6000);
+      self.timer = setTimeout(function () { self.run(); }, Math.min(120e3, 15e3 * self.tries));
+    });
+  }
+};
+window.addEventListener('online', function () { Outbox.run(); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) Outbox.run(); });
+
+/** What an entry waiting to upload looks like on screen (its title is a stand-in until Claude names it). */
+function shownRec(rec) {
+  var prev = byId(rec.id);
+  var e = normEntry(Object.assign({}, rec, { created: prev ? prev.created : new Date().toISOString(), updated: '', fileId: prev ? prev.fileId : '' }));
+  if (!e) return rec;
+  if (!e.title) { e.title = Store.basicTitle(rec); e.autoTitle = true; }
+  e.pending = true;
+  return e;
+}
+
+function pendingText() { return Outbox.busy ? 'Saving…' : 'Waiting to upload'; }
+function refreshPending() {
+  var waiting = {};
+  Outbox.items.forEach(function (x) { waiting[x.rec.id] = 1; });
+  S.entries.forEach(function (e) { if (e.pending && !waiting[e.id]) delete e.pending; });
+  if (S.loaded) render();
+  if (S.openId) { var cur = byId(S.openId); if (cur) fillEntry(cur); }
+}
+
 // Makes sure the Google sign-in has enough time left before starting work that uploads.
 function fresh(minutes) {
   if (Auth.valid((minutes || 20) * 60e3) || !navigator.onLine) return true;
@@ -353,6 +425,7 @@ function cardHTML(e, sameDay) {
   var mc = counts([e]);
   if (mc.photos) meta.push(plural(mc.photos, 'photo'));
   if (mc.videos) meta.push(plural(mc.videos, 'video'));
+  if (e.pending) meta.push('<b class="pend">' + pendingText() + '</b>');
   return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + '" data-open="' + esc(e.id) + '">' +
     '<span class="dt" aria-hidden="true"><span class="dw">' + DOW[d.getDay()].slice(0, 3) + '</span><span class="dn">' + d.getDate() + '</span></span>' +
     '<span style="min-width:0;display:block">' +
@@ -531,7 +604,7 @@ function entryHTML(e) {
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
     (e.tags.length ? '<div class="tags">' + e.tags.map(function (t) { return '<button class="chip" data-tag="' + esc(t) + '">#' + esc(t) + '</button>'; }).join('') + '</div>' : '') +
-    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' +
+    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') +
     (LIVE && e.fileId ? '<a href="https://drive.google.com/file/d/' + esc(e.fileId) + '/view" target="_blank" rel="noopener">Open file in Google Drive</a>' : '') + '</div>';
 }
 
@@ -629,13 +702,16 @@ function openGalleryItem(gi) {
 
 function deleteEntry(id) {
   var e = byId(id); if (!e) return;
+  if (Outbox.sending(id)) { toast('This entry is still saving. Try again in a moment.'); return; }
   confirmDlg({
     title: 'Delete this entry?',
     text: LIVE ? 'The text, photos and videos move to your Google Drive trash. You can restore them from there for 30 days.' : 'This removes the sample entry from the preview.',
     ok: 'Delete', danger: true
   }).then(function (yes) {
     if (!yes) return;
+    var queued = Outbox.drop(id);
     API.remove(id).then(function () {
+      if (queued) API.discard(queued.rec.media.map(pickIds)).catch(function () {});
       S.entries = S.entries.filter(function (x) { return x.id !== id; }); cacheIndex();
       if (S.openId === id) Nav.pop();
       render(); toast('Entry deleted');
@@ -842,7 +918,7 @@ function openEditor(id, presetDay) {
   };
   $('#ed-heading').textContent = ex ? 'Edit entry' : 'New entry';
   $('#ed-date').value = date;
-  $('#ed-title').value = ex ? ex.title : '';
+  $('#ed-title').value = ex && !ex.autoTitle ? ex.title : '';
   $('#ed-body').value = ex ? ex.body : '';
   ED.base = edSnapshot();                // what "no changes" looks like
 
@@ -988,14 +1064,20 @@ function processUpload(m) {
     return API.target(($('#ed-date').value || localStr(new Date())));
   }).then(function (tgt) {
     var name = ($('#ed-date').value || localStr(new Date())).slice(0, 10) + ' ' + m.name;
-    return API.upload(m.file, { name: name, folderId: tgt.folderId, mime: m.mime }, function (f) { setProg(m, 0.04 + f * 0.88); })
-      .then(function (id) {
-        m.id = id;
-        return info.thumb ? API.upload(info.thumb, { name: id + '.thumb.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }) : '';
-      }).then(function (thumbId) {
-        m.thumb = thumbId || ''; setProg(m, 0.96);
-        return info.preview ? API.upload(info.preview, { name: m.id + '.preview.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }) : '';
-      }).then(function (prevId) { m.preview = prevId || ''; });
+    // The original and its two small previews upload at the same time.
+    var got = {};
+    var up = function (k, blob, meta, prog) {
+      if (!blob) return Promise.resolve('');
+      return API.upload(blob, meta, prog).then(function (id) { got[k] = id; return id; });
+    };
+    return Promise.all([
+      up('id', m.file, { name: name, folderId: tgt.folderId, mime: m.mime }, function (f) { setProg(m, 0.04 + f * 0.92); }),
+      up('thumb', info.thumb, { name: name + '.thumb.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }),
+      up('preview', info.preview, { name: name + '.preview.jpg', folderId: tgt.previewId, mime: 'image/jpeg' })
+    ]).then(function (ids) { m.id = ids[0]; m.thumb = ids[1]; m.preview = ids[2]; }, function (err) {
+      if (got.id || got.thumb || got.preview) API.discard([{ id: got.id || '', thumb: got.thumb || '', preview: got.preview || '' }]).catch(function () {});
+      throw err;
+    });
   }).then(function () {
     if (m.cancelled || ED !== ed || ed.media.indexOf(m) < 0) { API.discard([pickIds(m)]).catch(function () {}); return; }
     m.status = 'done'; m.prog = 1; delete m.file;
@@ -1023,27 +1105,15 @@ function saveEditor() {
     media: ED.media.filter(function (m) { return m.status === 'done' && m.id; }).map(pickMedia)
   };
   if (!rec.title && !rec.body.trim() && !rec.media.length) { toast('Write something or add a photo first.'); return; }
-  b.setAttribute('data-saving', '1'); b.disabled = true; b.textContent = 'Saving…';
   var wasNew = ED.isNew;
-  if (!rec.title && rec.body.trim() && S.aiTitles) b.textContent = 'Naming…';
-  API.save(rec).then(function (saved) {
-    var note = saved._note; delete saved._note;
-    saved = normEntry(saved);
-    if (!saved) throw new Error('The saved entry came back damaged. Reload the app.');
-    upsert(saved); lsDel('diari-draft');
-    b.removeAttribute('data-saving');
-    ED.force = true; Nav.pop();
-    render();
-    if (S.openId === saved.id) fillEntry(saved);
-    else if (wasNew) setTimeout(function () { openEntry(saved.id); }, 120);
-    if (note) toast(note, 7000);
-    else toast(LIVE ? 'Saved to Google Drive' : 'Saved in this preview');
-  }).catch(function (err) {
-    b.removeAttribute('data-saving'); b.disabled = false; b.textContent = 'Save';
-    saveDraft();
-    if (err && err.expired) { reauth(); return; }
-    toast(errText(err) + ' Your writing is kept on this device.', 6000);
-  });
+  // Show it straight away; Google Drive gets it in the background.
+  upsert(shownRec(rec));
+  Outbox.add(rec);
+  lsDel('diari-draft');
+  ED.force = true; Nav.pop();
+  render();
+  if (S.openId === rec.id) fillEntry(byId(rec.id));
+  else if (wasNew) setTimeout(function () { openEntry(rec.id); }, 120);
 }
 
 edSheet.addEventListener('click', function (ev) {
@@ -1242,7 +1312,8 @@ function boot() {
   if (!Auth.valid(10 * 60e3)) {
     if (!navigator.onLine && hasCache) {
       document.body.classList.remove('signed-out'); $('#fab').hidden = false;
-      S.entries = normList(cached); sortEntries(); S.loaded = true; render();
+      Outbox.load();
+      S.entries = normList(cached); sortEntries(); Outbox.overlay(); S.loaded = true; render();
       toast('You are offline. Showing the copy saved on this device.', 5000);
       return;
     }
@@ -1257,13 +1328,15 @@ function boot() {
   var authMsg = Auth.error ? (Auth.error in AUTH_ERRORS ? AUTH_ERRORS[Auth.error] : Auth.error) : '';
   $('#fab').hidden = false;
   document.body.classList.remove('signed-out');
-  if (hasCache) { S.entries = normList(cached); sortEntries(); S.loaded = true; render(); }
+  Outbox.load();
+  if (hasCache) { S.entries = normList(cached); sortEntries(); Outbox.overlay(); S.loaded = true; render(); }
   else view.innerHTML = '<div style="height:44px"></div>' + '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
   API.boot().then(function (r) {
     if (r.setup || r.moveUnfinished) { showSetup(!!r.moveUnfinished, authMsg); return; }
     if (authMsg) toast(authMsg, 7000);
-    S.entries = normList(r.index.entries); sortEntries();
+    S.entries = normList(r.index.entries); sortEntries(); Outbox.overlay();
     S.rootUrl = /^https:\/\/drive\.google\.com\//.test(r.rootUrl || '') ? r.rootUrl : ''; S.aiTitles = r.aiTitles || ''; S.loaded = true; cacheIndex(); render();
+    Outbox.run();
     var re = lsGet('diari-reopen');
     if (re) { lsDel('diari-reopen'); if (Date.now() - re.at < 30 * 60e3 && (!re.id || byId(re.id))) openEditor(re.id || null); }
   }).catch(function (err) {

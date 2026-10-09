@@ -170,7 +170,7 @@ function getMeta(id, fields) { return dj(DRIVE + '/files/' + encodeURIComponent(
 
 function readText(id) {
   return driveFetch(DRIVE + '/files/' + encodeURIComponent(id) + '?alt=media').then(function (r) {
-    if (!r.ok) return driveError(r).then(function (m) { throw new Error(m); });
+    if (!r.ok) return driveError(r).then(function (m) { var e = new Error(m); e.status = r.status; throw e; });
     return r.text();
   });
 }
@@ -244,15 +244,26 @@ function createRoot() {
   }).then(function (r) { resetCaches(); lsSet('diari-root', r.id); return r.id; });
 }
 
-function resetCaches() { rootP = null; settingsP = null; folderCache = {}; targets = {}; }
+function resetCaches() { rootP = null; settingsP = null; folderCache = {}; targets = {}; indexIds = {}; }
 
+var indexIds = {};               // Journal folder id -> index file id, saves one lookup per save
 function readIndex(rootId) {
-  return findOne(rootId, INDEX_NAME).then(function (f) {
-    if (!f) return null;
-    return readText(f.id).then(function (t) {
-      var parsed; try { parsed = JSON.parse(t); } catch (e) { return null; }
-      if (!parsed || !Array.isArray(parsed.entries)) return null;
-      return { version: 1, entries: parsed.entries.map(cleanStored).filter(Boolean), fileId: f.id };
+  var parse = function (t, id) {
+    var parsed; try { parsed = JSON.parse(t); } catch (e) { return null; }
+    if (!parsed || !Array.isArray(parsed.entries)) return null;
+    return { version: 1, entries: parsed.entries.map(cleanStored).filter(Boolean), fileId: id };
+  };
+  var known = indexIds[rootId];
+  var fast = known ? readText(known).then(function (t) { return { t: t }; }, function (e) {
+    if (e.status === 404) { delete indexIds[rootId]; return null; }
+    throw e;
+  }) : Promise.resolve(null);
+  return fast.then(function (hit) {
+    if (hit) return parse(hit.t, known);
+    return findOne(rootId, INDEX_NAME).then(function (f) {
+      if (!f) return null;
+      indexIds[rootId] = f.id;
+      return readText(f.id).then(function (t) { return parse(t, f.id); });
     });
   });
 }
@@ -263,7 +274,7 @@ function writeIndex(rootId, index) {
   if (index.fileId) return updateFile(index.fileId, text, {}, null, 'application/json');
   return findOne(rootId, INDEX_NAME).then(function (f) {
     if (f) return updateFile(f.id, text, {}, null, 'application/json');
-    return createFile(rootId, INDEX_NAME, text, 'application/json').then(function (r) { index.fileId = r.id; });
+    return createFile(rootId, INDEX_NAME, text, 'application/json').then(function (r) { index.fileId = r.id; indexIds[rootId] = r.id; });
   });
 }
 
@@ -528,6 +539,34 @@ var IDB = (function () {
 
 var targets = {};
 
+/** Files up to 5 MB go up in a single request. */
+function uploadSmall(blob, meta, mime, onProg) {
+  if (!Auth.valid(15e3)) return Promise.reject(Expired());
+  var b = 'diari' + rnd(8);
+  var head = '--' + b + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify({ name: meta.name, parents: [meta.folderId], description: MEDIA_TAG, mimeType: mime }) +
+    '\r\n--' + b + '\r\nContent-Type: ' + mime + '\r\n\r\n';
+  var body = new Blob([head, blob, '\r\n--' + b + '--']);
+  return new Promise(function (res, rej) {
+    var x = new XMLHttpRequest();
+    x.open('POST', UPLOAD + '/files?uploadType=multipart&fields=id');
+    x.setRequestHeader('Authorization', 'Bearer ' + Auth.token);
+    x.setRequestHeader('Content-Type', 'multipart/related; boundary=' + b);
+    x.upload.onprogress = function (e) { if (onProg && e.total) onProg(Math.min(1, e.loaded / e.total)); };
+    x.onload = function () {
+      if (x.status === 401) { Auth.token = ''; lsDel('diari-auth'); rej(Expired()); return; }
+      if (x.status >= 200 && x.status < 300) {
+        try { res(JSON.parse(x.responseText).id); } catch (e) { rej(new Error('Google Drive sent an unexpected reply. Try again.')); }
+        return;
+      }
+      var msg = ''; try { msg = JSON.parse(x.responseText).error.message; } catch (e) {}
+      rej(new Error('Google Drive said: ' + (msg || 'error ' + x.status)));
+    };
+    x.onerror = function () { rej(new Error('The upload lost its connection. Tap the item to try again.')); };
+    x.send(body);
+  });
+}
+
 /* ================================================================ */
 /* Moving an earlier journal in (needs full Drive access, once)     */
 /* ================================================================ */
@@ -697,15 +736,19 @@ window.DiariStore = {
 
   save: function (input) {
     var rec = cleanRec(input), note = '';
+    // Claude's title, the index and the month folder are fetched at the same time.
     var titled = rec.title ? Promise.resolve() : makeTitle(rec).then(function (t) { rec.title = t.title; note = t.note; });
-    return titled.then(root).then(function (r) {
-      return readIndex(r).then(function (idx) { return idx || rebuildIndex(r); }).then(function (index) {
+    return root().then(function (r) {
+      var monthP = folder(r, rec.date.slice(0, 4)).then(function (y) { return folder(y, rec.date.slice(5, 7)); });
+      var indexP = readIndex(r).then(function (idx) { return idx || rebuildIndex(r); });
+      return Promise.all([indexP, monthP, titled]).then(function (got) {
+        var index = got[0], monthNow = got[1];
         var i = index.entries.findIndex(function (e) { return e.id === rec.id; });
         var prev = i >= 0 ? index.entries[i] : null, now = new Date().toISOString();
         rec.created = prev && prev.created ? prev.created : now;
         rec.updated = now;
         var name = fileName(rec), text = toMarkdown(rec);
-        return folder(r, rec.date.slice(0, 4)).then(function (y) { return folder(y, rec.date.slice(5, 7)); }).then(function (monthId) {
+        return Promise.resolve(monthNow).then(function (monthId) {
           var existing = prev && prev.fileId ? getMeta(prev.fileId, 'id,name,trashed,parents').catch(function (e) { if (e.expired) throw e; return null; }) : Promise.resolve(null);
           return existing.then(function (f) {
             if (f && !f.trashed) {
@@ -790,6 +833,7 @@ window.DiariStore = {
 
   upload: function (blob, meta, onProg) {
     var size = blob.size, mime = meta.mime || blob.type || 'application/octet-stream';
+    if (size <= 5 * 1024 * 1024) return uploadSmall(blob, meta, mime, onProg);
     return driveFetch(UPLOAD + '/files?uploadType=resumable&fields=id', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': mime, 'X-Upload-Content-Length': String(size) },
