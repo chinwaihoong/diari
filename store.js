@@ -878,6 +878,14 @@ window.DiariStore = {
     });
   },
 
+  /** The file itself, for remaking previews. */
+  blob: function (id) {
+    return driveFetch(DRIVE + '/files/' + encodeURIComponent(id) + '?alt=media').then(function (r) {
+      if (!r.ok) return driveError(r).then(function (m) { var e = new Error(m); e.status = r.status; throw e; });
+      return r.blob();
+    });
+  },
+
   /** Saves (or removes, with '') the Claude key after checking it with Claude. */
   setClaudeKey: function (key) {
     key = String(key || '').trim();

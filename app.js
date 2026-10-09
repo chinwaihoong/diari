@@ -258,6 +258,12 @@ function fillImg(img) {
 function observeImgs(root) {
   $$('img[data-mid]:not([data-done])', root).forEach(function (img) { if (io) io.observe(img); else fillImg(img); });
 }
+/** The small picture for a photo or video; a photo without previews shows the original. */
+function thumbTag(m, big) {
+  var id = big ? (m.preview || m.thumb) : (m.thumb || m.preview);
+  if (id) return imgTag(id);
+  return m.type === 'photo' ? imgTag(m.id, true) : imgTag('');
+}
 function imgTag(id, full) {
   if (!id) return '<span class="ph-icon">' + I.image + '</span>';
   return '<img class="mimg" alt="" data-mid="' + esc(id) + '"' + (full ? ' data-full="1"' : '') + '>';
@@ -266,31 +272,74 @@ function imgTag(id, full) {
 /* ================================================================ */
 /* Photo and video processing (before upload)                       */
 /* ================================================================ */
-function scaled(src, max, q) {
-  var sw = src.videoWidth || src.naturalWidth || src.width, sh = src.videoHeight || src.naturalHeight || src.height;
-  if (!sw || !sh) return Promise.resolve(null);
-  var s = Math.min(1, max / Math.max(sw, sh));
+// True when something was actually drawn. A failed draw leaves the canvas empty, which turns black as a JPEG.
+function drawn(c) {
+  try {
+    var x = c.getContext('2d');
+    for (var i = 1; i <= 5; i++) for (var j = 1; j <= 5; j++) {
+      if (x.getImageData(Math.floor(c.width * i / 6), Math.floor(c.height * j / 6), 1, 1).data[3] > 0) return true;
+    }
+    return false;
+  } catch (e) { return true; }
+}
+
+function toJpeg(src, w, h, q) {
   var c = document.createElement('canvas');
-  c.width = Math.max(1, Math.round(sw * s)); c.height = Math.max(1, Math.round(sh * s));
-  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(src, 0, 0, w, h);
+  if (!drawn(c)) return Promise.resolve(null);
   return new Promise(function (res) { try { c.toBlob(function (b) { res(b); }, 'image/jpeg', q); } catch (e) { res(null); } });
 }
 
-function photoInfo(file) {
-  var load = (window.createImageBitmap ? createImageBitmap(file, { imageOrientation: 'from-image' }) : Promise.reject())
-    .catch(function () {
-      return new Promise(function (res, rej) {
-        var img = new Image(), u = URL.createObjectURL(file);
-        img.onload = function () { URL.revokeObjectURL(u); res(img); };
-        img.onerror = function () { URL.revokeObjectURL(u); rej(new Error('unreadable')); };
-        img.src = u;
+function fit(w, h, max) {
+  var s = Math.min(1, max / Math.max(w, h));
+  return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
+}
+
+// Video frames.
+function scaled(src, max, q) {
+  var sw = src.videoWidth || src.naturalWidth || src.width, sh = src.videoHeight || src.naturalHeight || src.height;
+  if (!sw || !sh) return Promise.resolve(null);
+  var d = fit(sw, sh, max);
+  return toJpeg(src, d[0], d[1], q);
+}
+
+function loadImg(blob) {
+  return new Promise(function (res, rej) {
+    var img = new Image(), u = URL.createObjectURL(blob);
+    img.onload = function () { URL.revokeObjectURL(u); res(img); };
+    img.onerror = function () { URL.revokeObjectURL(u); rej(new Error('This photo format cannot be read here.')); };
+    img.src = u;
+  });
+}
+
+// Photos are decoded straight to the small size. Drawing a full-size phone photo fails silently on
+// many Android phones (too big for the graphics chip) and used to leave a black preview.
+function photoJpeg(file, w, h, max, q) {
+  var d = fit(w, h, max);
+  var ways = [
+    function () { return createImageBitmap(file, { resizeWidth: d[0], resizeHeight: d[1], resizeQuality: 'high', imageOrientation: 'from-image' }); },
+    function () { return loadImg(file); }
+  ];
+  var i = 0;
+  function next() {
+    if (i >= ways.length) return Promise.resolve(null);
+    var way = ways[i++];
+    return Promise.resolve().then(way).then(function (src) {
+      return toJpeg(src, d[0], d[1], q).then(function (b) {
+        if (src.close) src.close();
+        return b || next();
       });
-    });
-  return load.then(function (src) {
-    var w = src.naturalWidth || src.width, h = src.naturalHeight || src.height;
-    return Promise.all([scaled(src, 480, 0.74), scaled(src, 1600, 0.84)]).then(function (b) {
-      if (src.close) src.close();
-      return { w: w, h: h, thumb: b[0], preview: b[1] };
+    }, next);
+  }
+  return next();
+}
+
+function photoInfo(file) {
+  return loadImg(file).then(function (img) {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    return photoJpeg(file, w, h, 480, 0.74).then(function (thumb) {
+      return photoJpeg(file, w, h, 1600, 0.84).then(function (preview) { return { w: w, h: h, thumb: thumb, preview: preview }; });
     });
   }).catch(function () { return {}; });
 }
@@ -309,10 +358,14 @@ function videoInfo(file) {
       if (!v.videoWidth) { finish({ dur: d }); return; }
       v.currentTime = Math.min(1, d / 4 || 0.1);
     };
+    var tries = 0;
     v.onseeked = function () {
-      Promise.all([scaled(v, 480, 0.74), scaled(v, 1280, 0.82)]).then(function (b) {
-        finish({ w: v.videoWidth, h: v.videoHeight, dur: isFinite(v.duration) ? v.duration : 0, thumb: b[0], preview: b[1] });
-      }).catch(function () { finish({ dur: v.duration }); });
+      setTimeout(function () {
+        Promise.all([scaled(v, 480, 0.74), scaled(v, 1280, 0.82)]).then(function (b) {
+          if (!b[0] && tries++ < 2) { v.currentTime = Math.min((v.duration || 1) * 0.5, v.currentTime + 0.5); return; }   // frame not ready yet
+          finish({ w: v.videoWidth, h: v.videoHeight, dur: isFinite(v.duration) ? v.duration : 0, thumb: b[0], preview: b[1] });
+        }).catch(function () { finish({ dur: v.duration }); });
+      }, 120);
     };
     v.onerror = function () { finish({}); };
     setTimeout(function () { finish({}); }, 10000);
@@ -416,7 +469,7 @@ function cardHTML(e, sameDay) {
   var ex = plain(e.body).slice(0, 220);
   var thumb = '';
   if (m0) {
-    thumb = '<div class="c-thumb">' + imgTag(m0.thumb) +
+    thumb = '<div class="c-thumb">' + thumbTag(m0) +
       (m0.type === 'video' ? '<span class="badge">' + I.play + fmtDur(m0.dur) + '</span>' : '') +
       (e.media.length > 1 ? '<span class="cnt">' + e.media.length + '</span>' : '') + '</div>';
   }
@@ -483,7 +536,7 @@ function otdHTML() {
   if (!hits.length) return '';
   var e = hits[0], ago = y - +e.date.slice(0, 4), m0 = e.media[0];
   return '<button class="otd" data-open="' + esc(e.id) + '">' +
-    (m0 ? '<span class="ph">' + imgTag(m0.thumb) + '</span>' : '') +
+    (m0 ? '<span class="ph">' + thumbTag(m0) + '</span>' : '') +
     '<div><div class="k">On this day · ' + plural(ago, 'year') + ' ago</div><div class="t">' + esc(e.title || plain(e.body).slice(0, 60) || 'Untitled') + '</div>' +
     '<div class="s">' + esc(fmtLong(e.date)) + (hits.length > 1 ? ' · and ' + (hits.length - 1) + ' more' : '') + '</div></div></button>';
 }
@@ -547,7 +600,7 @@ function renderMedia() {
       if (g.p) bits.push(plural(g.p, 'photo')); if (g.v) bits.push(plural(g.v, 'video'));
       html += '<div class="month"><h2>' + monthName(k) + '</h2><span>' + bits.join(' · ') + '</span></div><div class="mgrid">';
     }
-    html += '<button class="mt" data-mi="' + i + '" aria-label="' + (m.type === 'video' ? 'Video' : 'Photo') + ' from ' + esc(fmtLong(m.date)) + '">' + imgTag(m.thumb) +
+    html += '<button class="mt" data-mi="' + i + '" aria-label="' + (m.type === 'video' ? 'Video' : 'Photo') + ' from ' + esc(fmtLong(m.date)) + '">' + thumbTag(m) +
       (m.type === 'video' ? '<span class="badge">' + I.play + fmtDur(m.dur) + '</span>' : '') + '</button>';
   });
   html += '</div>';
@@ -586,10 +639,10 @@ function galleryHTML(e) {
       var ratio = m.w && m.h ? Math.max(0.8, Math.min(1.78, m.w / m.h)) : 4 / 3;
       ar = ' style="--ar:' + ratio.toFixed(3) + '"';
     }
-    var src = c === 'hero' || c === 'half' ? (m.preview || m.thumb) : (m.thumb || m.preview);
+    var big = c === 'hero' || c === 'half';
     var label = (m.type === 'video' ? 'Play video' : 'Open photo') + (m.dur ? ', ' + fmtDur(m.dur) : '');
     return '<div class="gi ' + c + '" role="button" tabindex="0" data-gi="' + i + '" aria-label="' + label + '"' + ar + '>' +
-      imgTag(src) +
+      thumbTag(m, big) +
       (m.type === 'video' ? '<span class="play">' + I.play + '</span><span class="badge">' + fmtDur(m.dur) + '</span>' : '') +
       (extra > 0 && i === shown.length - 1 ? '<span class="more">+' + extra + '</span>' : '') + '</div>';
   }).join('') + '</div>';
@@ -822,6 +875,8 @@ function openSettings() {
         : '<p class="muted">In Chrome, open the ⋮ menu and tap <b>Install app</b> (or <b>Add to Home screen</b>). On a PC, click the install icon at the right of the address bar.</p>')) +
     '<h3>Fix the list</h3><p class="muted">If you edit, move or delete entry files in Google Drive yourself, rebuild the list from the files.</p>' +
     '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
+    '<h3>Photo previews</h3><p class="muted">If some photos show as black squares, Diari can make their previews again from the original photos in your Drive.</p>' +
+    '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
     '<h3>Earlier journal</h3><p class="muted">Diari only sees files it created. To bring in entries from the earlier version of Diari, it asks once for access to your whole Drive, copies them in, then gives that access up.</p>' +
     '<button class="btn ghost" id="btn-move">Bring in an earlier journal</button>' +
     '<h3>Account</h3><p>' + (Auth.email ? 'Signed in as <b>' + esc(Auth.email) + '</b>' : 'Signed in with Google') + '</p>' +
@@ -867,6 +922,12 @@ function openSettings() {
     }).catch(fail)
       .then(function () { b.disabled = false; b.textContent = 'Rebuild from Drive files'; });
   };
+  $('#btn-previews', box).onclick = function () {
+    var b = this; b.disabled = true;
+    fixPreviews(function (n, total) { b.textContent = 'Checking ' + n + ' of ' + total + '…'; }).then(function (fixed) {
+      toast(fixed ? 'Fixed ' + plural(fixed, 'photo preview') + '. Saving to Google Drive…' : 'All photo previews look fine.', 5000);
+    }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Fix black photo previews'; });
+  };
   $('#btn-move', box).onclick = function () {
     confirmDlg({ title: 'Bring in an earlier journal?', text: 'Google will ask for access to your whole Drive, just for this. Diari copies the entries in, renames the old Journal folder to “Journal - old copy”, then gives that access up.', ok: 'Continue' }).then(function (yes) {
       if (yes) Auth.signIn(false, 'move');
@@ -879,6 +940,62 @@ function openSettings() {
     });
   };
   if (!$('#sheet-settings').classList.contains('open')) openSheet($('#sheet-settings'));
+}
+
+/* Remaking photo previews that came out black (made before the fix in October 2026). */
+function isBlack(blob) {
+  return createImageBitmap(blob, { resizeWidth: 16, resizeHeight: 16 }).then(function (bm) {
+    var c = document.createElement('canvas'); c.width = 16; c.height = 16;
+    var x = c.getContext('2d'); x.drawImage(bm, 0, 0); if (bm.close) bm.close();
+    var d = x.getImageData(0, 0, 16, 16).data, top = 0;
+    for (var i = 0; i < d.length; i += 4) top = Math.max(top, d[i], d[i + 1], d[i + 2]);
+    return top < 10;
+  }).catch(function () { return false; });
+}
+
+function fixPreviews(onProg) {
+  var todo = [];
+  S.entries.forEach(function (e) {
+    if (e.pending) return;
+    e.media.forEach(function (m, k) { if (m.type === 'photo') todo.push({ e: e, k: k }); });
+  });
+  var changed = {}, old = [], n = 0, fixed = 0, chain = Promise.resolve();
+  todo.forEach(function (t) {
+    chain = chain.then(function () {
+      n++; if (onProg) onProg(n, todo.length);
+      var m = t.e.media[t.k];
+      var bad = m.thumb ? API.blob(m.thumb).then(isBlack, function (err) { if (err.expired) throw err; return true; }) : Promise.resolve(true);
+      return bad.then(function (isBad) {
+        if (!isBad) return;
+        return API.blob(m.id).then(photoInfo).then(function (info) {
+          if (!info.thumb) return;                           // can't read this photo here; it still shows the original
+          return API.target(t.e.date).then(function (tgt) {
+            var base = t.e.date.slice(0, 10) + ' ' + (m.name || 'photo.jpg');
+            return Promise.all([
+              API.upload(info.thumb, { name: base + '.thumb.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }),
+              info.preview ? API.upload(info.preview, { name: base + '.preview.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }) : ''
+            ]);
+          }).then(function (ids) {
+            var e = changed[t.e.id] || (changed[t.e.id] = Object.assign({}, t.e, { media: t.e.media.slice() }));
+            old.push({ id: '', thumb: m.thumb || '', preview: m.preview || '' });
+            e.media[t.k] = Object.assign({}, m, { thumb: ids[0], preview: ids[1] || '', w: info.w || m.w, h: info.h || m.h });
+            fixed++;
+          });
+        });
+      });
+    });
+  });
+  return chain.then(function () {
+    Object.keys(changed).forEach(function (id) {
+      var e = changed[id];
+      var rec = { id: e.id, date: e.date, title: e.title, body: e.body, tags: e.tags.slice(), media: e.media.map(pickMedia) };
+      upsert(Object.assign(shownRec(rec), { title: e.title, autoTitle: false }));
+      Outbox.add(rec);
+    });
+    if (old.length) API.discard(old).catch(function () {});
+    render();
+    return fixed;
+  });
 }
 
 // "Install app" prompt from Chrome, kept until the person asks for it.
