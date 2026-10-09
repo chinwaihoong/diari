@@ -9,6 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
+var APP_VERSION = 'v6';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -272,23 +273,43 @@ function imgTag(id, full) {
 /* ================================================================ */
 /* Photo and video processing (before upload)                       */
 /* ================================================================ */
-// True when something was actually drawn. A failed draw leaves the canvas empty, which turns black as a JPEG.
-function drawn(c) {
-  try {
-    var x = c.getContext('2d');
-    for (var i = 1; i <= 5; i++) for (var j = 1; j <= 5; j++) {
-      if (x.getImageData(Math.floor(c.width * i / 6), Math.floor(c.height * j / 6), 1, 1).data[3] > 0) return true;
-    }
-    return false;
-  } catch (e) { return true; }
-}
+/* ---------- Making previews ----------
+   Phone cameras take very large photos. Drawing one at full size fails on many Android phones: the
+   graphics chip cannot hold it, and the result is empty or solid black. So previews are drawn on a
+   canvas kept in ordinary memory (willReadFrequently), decoded at small size where possible, and any
+   result that is empty or all black is thrown away and the next method is tried. */
+var PhotoLog = [];          // what happened to recent photos, shown in Settings
+function logPhoto(x) { PhotoLog.push(x); if (PhotoLog.length > 20) PhotoLog.shift(); lsSet('diari-photolog', PhotoLog); }
 
-function toJpeg(src, w, h, q) {
+function canvas2d(w, h) {
   var c = document.createElement('canvas');
   c.width = w; c.height = h;
-  c.getContext('2d').drawImage(src, 0, 0, w, h);
-  if (!drawn(c)) return Promise.resolve(null);
-  return new Promise(function (res) { try { c.toBlob(function (b) { res(b); }, 'image/jpeg', q); } catch (e) { res(null); } });
+  var x = null;
+  try { x = c.getContext('2d', { willReadFrequently: true }); } catch (e) {}
+  return { c: c, x: x || c.getContext('2d') };
+}
+
+/** 'ok', 'empty' (nothing drawn) or 'black'. */
+function looks(c, x) {
+  try {
+    var top = 0, alpha = 0;
+    for (var i = 1; i <= 6; i++) for (var j = 1; j <= 6; j++) {
+      var d = x.getImageData(Math.floor(c.width * i / 7), Math.floor(c.height * j / 7), 1, 1).data;
+      alpha = Math.max(alpha, d[3]); top = Math.max(top, d[0], d[1], d[2]);
+    }
+    return alpha === 0 ? 'empty' : top < 10 ? 'black' : 'ok';
+  } catch (e) { return 'ok'; }
+}
+
+/** Draws src at w×h; resolves { blob, look }. */
+function toJpeg(src, w, h, q) {
+  var k = canvas2d(w, h);
+  try { k.x.drawImage(src, 0, 0, w, h); } catch (e) { return Promise.resolve({ blob: null, look: 'error' }); }
+  var look = looks(k.c, k.x);
+  if (look === 'empty') return Promise.resolve({ blob: null, look: look });
+  return new Promise(function (res) {
+    try { k.c.toBlob(function (b) { res({ blob: b, look: look }); }, 'image/jpeg', q); } catch (e) { res({ blob: null, look: 'error' }); }
+  });
 }
 
 function fit(w, h, max) {
@@ -301,7 +322,7 @@ function scaled(src, max, q) {
   var sw = src.videoWidth || src.naturalWidth || src.width, sh = src.videoHeight || src.naturalHeight || src.height;
   if (!sw || !sh) return Promise.resolve(null);
   var d = fit(sw, sh, max);
-  return toJpeg(src, d[0], d[1], q);
+  return toJpeg(src, d[0], d[1], q).then(function (r) { return r.look === 'ok' ? r.blob : null; });
 }
 
 function loadImg(blob) {
@@ -313,35 +334,43 @@ function loadImg(blob) {
   });
 }
 
-// Photos are decoded straight to the small size. Drawing a full-size phone photo fails silently on
-// many Android phones (too big for the graphics chip) and used to leave a black preview.
-function photoJpeg(file, w, h, max, q) {
+/** Tries each way of reading the photo until one gives a real picture. log collects what happened. */
+function photoJpeg(file, w, h, max, q, log) {
   var d = fit(w, h, max);
   var ways = [
-    function () { return createImageBitmap(file, { resizeWidth: d[0], resizeHeight: d[1], resizeQuality: 'high', imageOrientation: 'from-image' }); },
-    function () { return loadImg(file); }
+    ['small', function () { return createImageBitmap(file, { resizeWidth: d[0], resizeHeight: d[1], resizeQuality: 'high', imageOrientation: 'from-image' }); }],
+    ['img', function () { return loadImg(file); }],
+    ['full', function () { return createImageBitmap(file, { imageOrientation: 'from-image' }); }]
   ];
   var i = 0;
   function next() {
-    if (i >= ways.length) return Promise.resolve(null);
+    if (i >= ways.length) return Promise.resolve(null);           // no good preview: the original photo is shown instead
     var way = ways[i++];
-    return Promise.resolve().then(way).then(function (src) {
-      return toJpeg(src, d[0], d[1], q).then(function (b) {
+    return Promise.resolve().then(way[1]).then(function (src) {
+      return toJpeg(src, d[0], d[1], q).then(function (r) {
         if (src.close) src.close();
-        return b || next();
+        log.push(way[0] + ':' + r.look);
+        if (r.look === 'ok') return r.blob;
+        return next();
       });
-    }, next);
+    }, function (e) { log.push(way[0] + ':failed'); return next(); });
   }
   return next();
 }
 
 function photoInfo(file) {
+  var entry = { at: new Date().toISOString(), name: String(file.name || '').slice(-40), type: file.type || '?', mb: Math.round((file.size || 0) / 1e5) / 10, steps: [] };
   return loadImg(file).then(function (img) {
     var w = img.naturalWidth, h = img.naturalHeight;
-    return photoJpeg(file, w, h, 480, 0.74).then(function (thumb) {
-      return photoJpeg(file, w, h, 1600, 0.84).then(function (preview) { return { w: w, h: h, thumb: thumb, preview: preview }; });
+    entry.size = w + '×' + h;
+    return photoJpeg(file, w, h, 480, 0.74, entry.steps).then(function (thumb) {
+      return photoJpeg(file, w, h, 1600, 0.84, entry.steps).then(function (preview) {
+        entry.result = thumb ? 'ok' : 'no preview';
+        logPhoto(entry);
+        return { w: w, h: h, thumb: thumb, preview: preview };
+      });
     });
-  }).catch(function () { return {}; });
+  }).catch(function (e) { entry.result = 'unreadable: ' + errText(e); logPhoto(entry); return {}; });
 }
 
 function videoInfo(file) {
@@ -877,11 +906,13 @@ function openSettings() {
     '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
     '<h3>Photo previews</h3><p class="muted">If some photos show as black squares, Diari can make their previews again from the original photos in your Drive.</p>' +
     '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
+    '<pre class="plog" id="photo-log" hidden></pre>' +
     '<h3>Earlier journal</h3><p class="muted">Diari only sees files it created. To bring in entries from the earlier version of Diari, it asks once for access to your whole Drive, copies them in, then gives that access up.</p>' +
     '<button class="btn ghost" id="btn-move">Bring in an earlier journal</button>' +
     '<h3>Account</h3><p>' + (Auth.email ? 'Signed in as <b>' + esc(Auth.email) + '</b>' : 'Signed in with Google') + '</p>' +
     '<button class="btn ghost" id="btn-signout">Sign out on this device</button>' +
-    '<h3>Videos</h3><p class="muted">Short clips start almost at once. Long videos download first, so they take a moment. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>';
+    '<h3>Videos</h3><p class="muted">Short clips start almost at once. Long videos download first, so they take a moment. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>' +
+    '<p class="muted" style="margin-top:28px;font-size:12px">Diari ' + APP_VERSION + '</p>';
 
   var bt = $('#btn-titles', box);
   if (bt) bt.onclick = function () {
@@ -924,8 +955,13 @@ function openSettings() {
   };
   $('#btn-previews', box).onclick = function () {
     var b = this; b.disabled = true;
-    fixPreviews(function (n, total) { b.textContent = 'Checking ' + n + ' of ' + total + '…'; }).then(function (fixed) {
-      toast(fixed ? 'Fixed ' + plural(fixed, 'photo preview') + '. Saving to Google Drive…' : 'All photo previews look fine.', 5000);
+    PhotoLog = [];
+    fixPreviews(function (n, total) { b.textContent = 'Checking ' + n + ' of ' + total + '…'; }).then(function (r) {
+      var msg = r.fixed ? 'Fixed ' + plural(r.fixed, 'photo preview') + '. Saving to Google Drive…'
+        : r.failed ? 'Could not make new previews on this device.' : 'All ' + plural(r.checked, 'photo preview') + ' look fine.';
+      if (r.failed && r.fixed) msg += ' ' + r.failed + ' could not be fixed.';
+      toast(msg, 6000);
+      showPhotoLog();
     }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Fix black photo previews'; });
   };
   $('#btn-move', box).onclick = function () {
@@ -942,11 +978,23 @@ function openSettings() {
   if (!$('#sheet-settings').classList.contains('open')) openSheet($('#sheet-settings'));
 }
 
+function showPhotoLog() {
+  var box = $('#photo-log'); if (!box) return;
+  var log = PhotoLog.length ? PhotoLog : (lsGet('diari-photolog') || []);
+  if (!log.length) { box.hidden = true; return; }
+  var gl = '';
+  try { var g = document.createElement('canvas').getContext('webgl'); gl = g ? g.getParameter(g.MAX_TEXTURE_SIZE) : 'none'; } catch (e) { gl = '?'; }
+  box.textContent = 'Diari ' + APP_VERSION + ' · graphics limit ' + gl + ' px\n' + log.slice(-8).map(function (x) {
+    return (x.name || 'photo') + ' · ' + x.type + ' · ' + (x.size || '?') + ' · ' + x.mb + ' MB → ' + x.result + (x.steps.length ? ' (' + x.steps.join(', ') + ')' : '');
+  }).join('\n');
+  box.hidden = false;
+}
+
 /* Remaking photo previews that came out black (made before the fix in October 2026). */
 function isBlack(blob) {
   return createImageBitmap(blob, { resizeWidth: 16, resizeHeight: 16 }).then(function (bm) {
-    var c = document.createElement('canvas'); c.width = 16; c.height = 16;
-    var x = c.getContext('2d'); x.drawImage(bm, 0, 0); if (bm.close) bm.close();
+    var k = canvas2d(16, 16), x = k.x;
+    x.drawImage(bm, 0, 0); if (bm.close) bm.close();
     var d = x.getImageData(0, 0, 16, 16).data, top = 0;
     for (var i = 0; i < d.length; i += 4) top = Math.max(top, d[i], d[i + 1], d[i + 2]);
     return top < 10;
@@ -959,7 +1007,7 @@ function fixPreviews(onProg) {
     if (e.pending) return;
     e.media.forEach(function (m, k) { if (m.type === 'photo') todo.push({ e: e, k: k }); });
   });
-  var changed = {}, old = [], n = 0, fixed = 0, chain = Promise.resolve();
+  var changed = {}, old = [], n = 0, fixed = 0, failed = 0, chain = Promise.resolve();
   todo.forEach(function (t) {
     chain = chain.then(function () {
       n++; if (onProg) onProg(n, todo.length);
@@ -967,8 +1015,8 @@ function fixPreviews(onProg) {
       var bad = m.thumb ? API.blob(m.thumb).then(isBlack, function (err) { if (err.expired) throw err; return true; }) : Promise.resolve(true);
       return bad.then(function (isBad) {
         if (!isBad) return;
-        return API.blob(m.id).then(photoInfo).then(function (info) {
-          if (!info.thumb) return;                           // can't read this photo here; it still shows the original
+        return API.blob(m.id).then(function (b) { b.name = m.name; return photoInfo(b); }).then(function (info) {
+          if (!info.thumb) { failed++; return; }             // can't read this photo here; it shows the original instead
           return API.target(t.e.date).then(function (tgt) {
             var base = t.e.date.slice(0, 10) + ' ' + (m.name || 'photo.jpg');
             return Promise.all([
@@ -994,7 +1042,7 @@ function fixPreviews(onProg) {
     });
     if (old.length) API.discard(old).catch(function () {});
     render();
-    return fixed;
+    return { fixed: fixed, failed: failed, checked: todo.length };
   });
 }
 
