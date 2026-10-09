@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v7';
+var APP_VERSION = 'v8';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -706,7 +706,7 @@ function fillEntry(e) {
   // Warm up the first video so it starts right away when tapped.
   var hero = e.media[0];
   var slow = navigator.connection && (navigator.connection.saveData || /2g/.test(navigator.connection.effectiveType || ''));
-  if (hero && hero.type === 'video' && (!hero.size || hero.size < 60e6) && !slow) Loader.get(hero.id, false);
+  if (hero && hero.type === 'video' && !Stream.ok() && (!hero.size || hero.size < 60e6) && !slow) Loader.get(hero.id, false);
 }
 
 function stopVideos(root) { $$('video', root).forEach(function (v) { try { v.pause(); } catch (e) {} }); }
@@ -719,8 +719,62 @@ function ringEl() {
   return r;
 }
 
+/* ---------- Videos stream through Diari's offline helper (sw.js), so they start at once ---------- */
+var Stream = {
+  ok: function () { return !!(navigator.serviceWorker && navigator.serviceWorker.controller) && Auth.valid(60e3); },
+  url: function (m) { return 'stream/' + encodeURIComponent(m.id) + (m.size ? '?s=' + Math.round(m.size) : ''); },
+  sendToken: function () {
+    var c = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (c && Auth.valid(30e3)) c.postMessage({ type: 'token', token: Auth.token, exp: Auth.exp });
+  }
+};
+if (navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener('message', function (e) {
+    if (e.data && e.data.type === 'need-token' && e.ports && e.ports[0]) {
+      e.ports[0].postMessage(Auth.valid(30e3) ? { token: Auth.token, exp: Auth.exp } : {});
+    }
+  });
+  navigator.serviceWorker.addEventListener('controllerchange', function () { Stream.sendToken(); });
+}
+
+function spinner() { return el('<span class="vspin" role="status" aria-label="Loading video"></span>'); }
+
+/** A video element that plays from the stream; calls fallback() if streaming does not work. */
+function streamVideo(m, poster, fallback) {
+  var v = document.createElement('video');
+  v.controls = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
+  if (poster) v.poster = poster;
+  var started = false;
+  v.addEventListener('loadeddata', function () { started = true; v.dispatchEvent(new Event('diari-ready')); });
+  v.addEventListener('error', function () { if (!started) fallback(); else videoFailFor(v, m); }, { once: true });
+  v.src = Stream.url(m);
+  return v;
+}
+function videoFailFor(v, m) { var box = v.parentNode; if (box) videoFail(box, m); }
+
 function playInline(tile, m) {
   if (tile.classList.contains('playing') || tile.classList.contains('loading')) return;
+  if (Stream.ok()) {
+    var playBtnS = $('.play', tile); if (playBtnS) playBtnS.hidden = true;
+    var posterS = $('img', tile);
+    var spin = spinner();
+    tile.classList.add('playing');
+    var v = streamVideo(m, posterS && posterS.src, function () {
+      // Streaming didn't work (for example an old phone browser): download the whole video instead.
+      v.remove(); spin.remove(); tile.classList.remove('playing');
+      if (playBtnS) playBtnS.hidden = false;
+      downloadAndPlay(tile, m);
+    });
+    v.addEventListener('diari-ready', function () { spin.remove(); });
+    $$('.badge', tile).forEach(function (b) { b.remove(); });
+    tile.appendChild(v); tile.appendChild(spin);
+    v.play().catch(function () {});
+    return;
+  }
+  downloadAndPlay(tile, m);
+}
+
+function downloadAndPlay(tile, m) {
   tile.classList.add('loading');
   var playBtn = $('.play', tile); if (playBtn) playBtn.hidden = true;
   var ring = ringEl(); tile.appendChild(ring);
@@ -830,6 +884,19 @@ function openLightbox(items, index, fromMedia) {
         stage.innerHTML = '<div class="lb-msg">This photo format cannot be shown in the browser.' +
           (LIVE ? ' <a href="https://drive.google.com/file/d/' + esc(m.id) + '/view" target="_blank" rel="noopener">Open it in Google Drive</a>.' : '') + '</div>';
       };
+    } else if (Stream.ok() && !m.noStream) {
+      var pid = m.preview || m.thumb;
+      var sp = spinner();
+      var sv = streamVideo(m, '', function () {
+        if (items[i] !== m) return;
+        m.noStream = true; show();                     // streaming didn't work: download instead
+      });
+      sv.autoplay = true;
+      sv.addEventListener('diari-ready', function () { sp.remove(); });
+      sv.addEventListener('error', function () {}, { once: true });
+      stage.appendChild(sv); stage.appendChild(sp);
+      if (pid) Loader.get(pid, true).p.then(function (u) { if (!sv.currentTime) sv.poster = u; }).catch(function () {});
+      sv.play().catch(function () {});
     } else {
       var posterId = m.preview || m.thumb;
       var ring = ringEl(); stage.appendChild(ring);
@@ -1493,6 +1560,7 @@ function boot() {
   var authMsg = Auth.error ? (Auth.error in AUTH_ERRORS ? AUTH_ERRORS[Auth.error] : Auth.error) : '';
   $('#fab').hidden = false;
   document.body.classList.remove('signed-out');
+  Stream.sendToken();
   Outbox.load();
   if (hasCache) { S.entries = normList(cached); sortEntries(); Outbox.overlay(); S.loaded = true; render(); }
   else view.innerHTML = '<div style="height:44px"></div>' + '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
