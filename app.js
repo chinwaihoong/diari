@@ -934,7 +934,12 @@ function openEditor(id, presetDay) {
   openSheet(edSheet);
   Nav.stack.pop();                       // replace the plain close with the "unsaved changes" check
   Nav.stack.push(editorBack);
-  if (!ex) setTimeout(function () { $('#ed-body').focus(); }, 320);
+  // Focus the text straight away, while the tap still counts as a tap, so Android opens the keyboard
+  // (and voice tools like Wispr Flow show their button) without a second tap.
+  if (!ex) {
+    try { $('#ed-body').focus({ preventScroll: true }); } catch (e) {}
+    setTimeout(function () { if (document.activeElement !== $('#ed-body')) $('#ed-body').focus(); }, 320);
+  }
 }
 
 function edDirty() { return ED && (edSnapshot() !== ED.base || ED.media.some(function (m) { return m.status !== 'done'; })); }
