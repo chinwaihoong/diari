@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v6';
+var APP_VERSION = 'v7';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -902,16 +902,17 @@ function openSettings() {
     (standalone ? '<p class="muted">Diari is installed on this device.</p>'
       : (Install.ev ? '<p><button class="btn primary" id="btn-install">Install Diari</button></p><p class="muted">Adds Diari to your home screen and app list. It opens full screen, like any other app.</p>'
         : '<p class="muted">In Chrome, open the ⋮ menu and tap <b>Install app</b> (or <b>Add to Home screen</b>). On a PC, click the install icon at the right of the address bar.</p>')) +
-    '<h3>Fix the list</h3><p class="muted">If you edit, move or delete entry files in Google Drive yourself, rebuild the list from the files.</p>' +
-    '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
-    '<h3>Photo previews</h3><p class="muted">If some photos show as black squares, Diari can make their previews again from the original photos in your Drive.</p>' +
-    '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
-    '<pre class="plog" id="photo-log" hidden></pre>' +
-    '<h3>Earlier journal</h3><p class="muted">Diari only sees files it created. To bring in entries from the earlier version of Diari, it asks once for access to your whole Drive, copies them in, then gives that access up.</p>' +
-    '<button class="btn ghost" id="btn-move">Bring in an earlier journal</button>' +
+
     '<h3>Account</h3><p>' + (Auth.email ? 'Signed in as <b>' + esc(Auth.email) + '</b>' : 'Signed in with Google') + '</p>' +
     '<button class="btn ghost" id="btn-signout">Sign out on this device</button>' +
     '<h3>Videos</h3><p class="muted">Short clips start almost at once. Long videos download first, so they take a moment. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>' +
+    '<details class="trouble" id="trouble"><summary>Troubleshooting</summary>' +
+      '<p class="muted">If an entry is missing from the list (for example after saving on two devices at the same moment), rebuild the list from the entry files in Drive.</p>' +
+      '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
+      '<p class="muted" style="margin-top:16px">If photos show as black squares, make their previews again from the original photos.</p>' +
+      '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
+      '<pre class="plog" id="photo-log" hidden></pre>' +
+    '</details>' +
     '<p class="muted" style="margin-top:28px;font-size:12px">Diari ' + APP_VERSION + '</p>';
 
   var bt = $('#btn-titles', box);
@@ -963,11 +964,6 @@ function openSettings() {
       toast(msg, 6000);
       showPhotoLog();
     }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Fix black photo previews'; });
-  };
-  $('#btn-move', box).onclick = function () {
-    confirmDlg({ title: 'Bring in an earlier journal?', text: 'Google will ask for access to your whole Drive, just for this. Diari copies the entries in, renames the old Journal folder to “Journal - old copy”, then gives that access up.', ok: 'Continue' }).then(function (yes) {
-      if (yes) Auth.signIn(false, 'move');
-    });
   };
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
@@ -1433,11 +1429,10 @@ function showSetup(resume, msg) {
       (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
       '<button class="btn primary" data-move>Continue moving</button>'
     : '<h2>Set up your journal</h2>' +
-      '<p>Diari only sees the files it creates in your Google Drive, never anything else.</p>' +
+      '<p>Diari keeps your journal in a Journal folder in your Google Drive, and only sees the files it creates there.</p>' +
       (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
-      '<button class="btn primary" data-move>Move my earlier journal</button>' +
-      '<p class="signin-note">If you used Diari before: Google asks once for access to your whole Drive. Diari copies your entries, photos and videos into a new Journal folder, renames the old one to “Journal - old copy”, then gives that access up. Delete the old copy when you have checked everything, so it doesn’t take up space twice.</p>' +
-      '<button class="btn ghost" data-fresh>Start a new journal</button>');
+      '<button class="btn primary" data-fresh>Start my journal</button>' +
+      '<p class="signin-note">Used the earlier Apps Script version of Diari? <button class="linkish" data-move>Move that journal in</button>. Google asks once for access to your whole Drive; Diari copies your entries, photos and videos in, renames the old folder to “Journal - old copy”, then gives that access up.</p>');
 }
 
 /** Runs right after Google gave full Drive access for the move. */
