@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v12';
+var APP_VERSION = 'v13';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -130,9 +130,12 @@ function confirmDlg(o) {
 /* ================================================================ */
 var API = Store;
 
-// A Google sign-in expired: keep what is being written, then sign in again and come back.
-function reauth() {
+// A Google sign-in runs out after an hour: keep what is being written, sign in again without any
+// screens, and come back to the same place (the editor, or the entry that was open).
+function reauth(resume) {
   if (ED) { saveDraft(); lsSet('diari-reopen', { id: ED.isNew ? '' : ED.id, at: Date.now() }); }
+  else if (resume) lsSet('diari-reopen', { id: resume.id || '', day: resume.day || '', at: Date.now() });
+  if (S.openId) lsSet('diari-reopen-view', { id: S.openId, at: Date.now() });
   toast('Signing in to Google again…', 8000);
   setTimeout(function () { Auth.signIn(true); }, 400);
 }
@@ -212,12 +215,19 @@ function refreshPending() {
   if (S.openId) { var cur = byId(S.openId); if (cur) fillEntry(cur); }
 }
 
-// Makes sure the Google sign-in has enough time left before starting work that uploads.
-function fresh(minutes) {
+// Makes sure the Google sign-in has enough time left before starting something. Writing only needs
+// a few minutes (Diari keeps the entry on the device and saves it when it can); uploads need more.
+function fresh(minutes, resume) {
   if (Auth.valid((minutes || 20) * 60e3) || !navigator.onLine) return true;
-  reauth();
+  reauth(resume);
   return false;
 }
+var RENEW_AT = 30 * 60e3;   // renew the Google sign-in quietly when the app opens or comes back with less than this left
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden || !S.loaded || ED || !navigator.onLine || !Auth.email || Auth.silentFailed || Auth.valid(RENEW_AT)) return;
+  if (Outbox.busy || !Copies.idle() || Uploads.any() || $('.lb')) return;          // never in the middle of something
+  reauth();
+});
 
 
 // One shared loader so the same photo or video is only downloaded once.
@@ -509,6 +519,7 @@ function cardHTML(e, sameDay) {
   if (mc.videos) meta.push(plural(mc.videos, 'video'));
   if (e.pending) meta.push('<b class="pend">' + pendingText() + '</b>');
   if (Copies.has(e.id)) meta.push('<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>');
+  if (Uploads.count(e.id)) meta.push('<b class="pend">' + Uploads.text(e.id) + '</b>');
   return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + '" data-open="' + esc(e.id) + '">' +
     '<span class="dt" aria-hidden="true"><span class="dw">' + DOW[d.getDay()].slice(0, 3) + '</span><span class="dn">' + d.getDate() + '</span></span>' +
     '<span style="min-width:0;display:block">' +
@@ -687,7 +698,8 @@ function entryHTML(e) {
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
     (e.tags.length ? '<div class="tags">' + e.tags.map(function (t) { return '<button class="chip" data-tag="' + esc(t) + '">#' + esc(t) + '</button>'; }).join('') + '</div>' : '') +
-    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') + (Copies.has(e.id) ? '<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>' : '') + '</div>';
+    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') + (Copies.has(e.id) ? '<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>' : '') +
+    (Uploads.count(e.id) ? '<b class="pend">' + Uploads.text(e.id) + '</b>' : '') + '</div>';
 }
 
 function openEntry(id) {
@@ -979,7 +991,10 @@ entrySheet.addEventListener('click', function (ev) {
   if (act) {
     var a = act.getAttribute('data-act');
     if (a === 'close') Nav.pop();
-    else if (a === 'edit') { if (fresh(20)) openEditor(S.openId); }
+    else if (a === 'edit') {
+      if (Uploads.count(S.openId)) { toast('Photos are still uploading to this entry. You can edit it when they are done.', 4500); return; }
+      if (fresh(3, { id: S.openId })) openEditor(S.openId);
+    }
     else if (a === 'delete') deleteEntry(S.openId);
     return;
   }
@@ -1541,11 +1556,10 @@ function updateHint() {
 
 function updateSave() {
   if (!ED) return;
-  var busy = ED.media.filter(function (m) { return m.status === 'prep' || m.status === 'uploading'; }).length;
   var b = $('#ed-save');
   if (b.getAttribute('data-saving')) return;
-  b.disabled = busy > 0;
-  b.textContent = busy ? 'Uploading ' + busy + '…' : 'Save';
+  b.disabled = false;
+  b.textContent = 'Save';
 }
 
 function autoGrow() { var t = $('#ed-body'); t.style.height = 'auto'; t.style.height = Math.max(t.scrollHeight, 200) + 'px'; }
@@ -1598,7 +1612,7 @@ function kindOf(f) {
 
 function addFiles(files) {
   Array.prototype.forEach.call(files, function (f) {
-    var m = { key: rid(8), type: kindOf(f), name: f.name || (kindOf(f) === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, status: 'prep', prog: 0, file: f, isNew: true };
+    var m = { key: rid(8), type: kindOf(f), name: f.name || (kindOf(f) === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, status: 'prep', prog: 0, file: f, isNew: true, ed: ED };
     if (m.type === 'photo') m.localThumb = URL.createObjectURL(f);
     if (m.type === 'video' && f.size > 500e6) toast('Large video (' + fmtSize(f.size) + '). Uploading will take a while.', 4500);
     ED.media.push(m);
@@ -1608,10 +1622,13 @@ function addFiles(files) {
   var tray = $('#ed-tray'); tray.scrollLeft = tray.scrollWidth;
 }
 
+/** The entry's date: from the editor while it is open, or as saved (uploads carry on after Save). */
+function edDate(ed) { return ed.savedDate || (ED === ed && $('#ed-date').value) || localStr(new Date()); }
+
 function processUpload(m) {
-  var ed = ED;
-  if (!ed || m.cancelled || ed.media.indexOf(m) < 0) return Promise.resolve();
-  m.status = 'prep'; m.prog = 0.02; renderTile(m); updateSave();
+  var ed = m.ed;
+  if (!ed || m.cancelled || ed.media.indexOf(m) < 0 || (ED !== ed && !ed.saved)) return Promise.resolve();
+  m.status = 'prep'; m.prog = Math.max(m.prog || 0, 0.02); renderTile(m); updateSave();
   var info;
   return (m.type === 'video' ? videoInfo(m.file) : photoInfo(m.file)).then(function (v) {
     info = v;
@@ -1619,9 +1636,9 @@ function processUpload(m) {
     if (v.thumb) { if (m.localThumb) URL.revokeObjectURL(m.localThumb); m.localThumb = URL.createObjectURL(v.thumb); }
     if (m.type === 'video' && !v.w) toast('This video may not play in every browser. It will still be saved.', 5000);
     m.status = 'uploading'; renderTile(m);
-    return API.target(($('#ed-date').value || localStr(new Date())));
+    return API.target(edDate(ed));
   }).then(function (tgt) {
-    var name = ($('#ed-date').value || localStr(new Date())).slice(0, 10) + ' ' + m.name;
+    var name = edDate(ed).slice(0, 10) + ' ' + m.name;
     // The original and its two small previews upload at the same time.
     var got = {};
     var up = function (k, blob, meta, prog) {
@@ -1637,15 +1654,23 @@ function processUpload(m) {
       throw err;
     });
   }).then(function () {
-    if (m.cancelled || ED !== ed || ed.media.indexOf(m) < 0) { API.discard([pickIds(m)]).catch(function () {}); return; }
+    if (m.cancelled || ed.media.indexOf(m) < 0 || (ED !== ed && !ed.saved)) { API.discard([pickIds(m)]).catch(function () {}); return; }
     m.status = 'done'; m.prog = 1;
-    if (m.type === 'video' && Copy.supported() && Copy.needed(m)) {
-      Copies.add({ entryId: ed.id, mediaId: m.id, file: m.file, name: (($('#ed-date').value || localStr(new Date())).slice(0, 10)) + ' ' + m.name,
-        date: $('#ed-date').value || localStr(new Date()) });
-    }
+    var file = m.file;
     delete m.file;
-    renderTile(m); updateSave(); saveDraft();
+    if (ed.saved && ED !== ed) attachUpload(ed, m);              // saved already: add it to the entry
+    else { renderTile(m); updateSave(); saveDraft(); }
+    if (m.type === 'video' && Copy.supported() && Copy.needed(m)) {
+      Copies.add({ entryId: ed.id, mediaId: m.id, file: file, name: edDate(ed).slice(0, 10) + ' ' + m.name, date: edDate(ed) });
+    }
   }).catch(function (err) {
+    if (ed.saved && ED !== ed) {
+      m.status = 'error';
+      Uploads.done(ed.id, m);
+      var e = byId(ed.id);
+      toast((m.type === 'video' ? 'A video' : 'A photo') + ' for “' + (e ? e.title : 'your entry') + '” could not be uploaded: ' + errText(err) + ' Open the entry and add it again.', 9000);
+      return;
+    }
     if (ED !== ed) return;
     m.status = 'error'; m.err = errText(err); renderTile(m); updateSave();
     if (err && err.expired) { toast('Your Google sign-in expired. Save your text, then add this photo or video again.', 7000); return; }
@@ -1653,10 +1678,63 @@ function processUpload(m) {
   });
 }
 
+/* Photos and videos still uploading when Save was tapped: they carry on, and join the entry when done. */
+var Uploads = {
+  n: {},                    // entry id -> { photo: count, video: count }
+  add: function (id, m) { var x = this.n[id] = this.n[id] || { photo: 0, video: 0 }; x[m.type]++; this.keep(); },
+  done: function (id, m) {
+    var x = this.n[id]; if (!x) return;
+    if (x[m.type]) x[m.type]--;
+    if (!x.photo && !x.video) delete this.n[id];
+    this.keep(); refreshPending();
+  },
+  count: function (id) { var x = this.n[id]; return x ? x.photo + x.video : 0; },
+  any: function () { return Object.keys(this.n).length > 0; },
+  text: function (id) {
+    var x = this.n[id], parts = [];
+    if (x.photo) parts.push(plural(x.photo, 'photo'));
+    if (x.video) parts.push(plural(x.video, 'video'));
+    return 'Uploading ' + parts.join(', ') + '…';
+  },
+  // Kept on the device so that, if Diari is closed before they finish, it can say so next time.
+  keep: function () { if (this.any()) lsSet('diari-uploading', { n: this.n, at: Date.now() }); else lsDel('diari-uploading'); },
+  leftover: function () {
+    var x = lsGet('diari-uploading'); lsDel('diari-uploading');
+    if (!x || !x.n || Date.now() - x.at > 14 * 864e5) return;
+    Object.keys(x.n).forEach(function (id) {
+      var c = x.n[id] || {}, e = byId(id), parts = [];
+      if (c.photo) parts.push(plural(c.photo, 'photo'));
+      if (c.video) parts.push(plural(c.video, 'video'));
+      if (!parts.length) return;
+      toast(parts.join(' and ') + ' for “' + (e ? e.title : 'an entry') + '” did not finish uploading because Diari was closed. Open the entry and add ' + (c.photo + c.video === 1 ? 'it' : 'them') + ' again.', 10000);
+    });
+  }
+};
+window.addEventListener('beforeunload', function (ev) {
+  if (Uploads.any()) { ev.preventDefault(); ev.returnValue = ''; }   // the browser asks "Leave site?"
+});
+
+function attachUpload(ed, m) {
+  var e = byId(ed.id);
+  if (!e) { Uploads.done(ed.id, m); API.discard([pickIds(m)]).catch(function () {}); return; }      // entry deleted meanwhile
+  var have = {};
+  e.media.forEach(function (x) { have[x.id] = x; });
+  // Keep the order the photos were added in the editor.
+  var media = ed.media.filter(function (x) { return x.status === 'done' && x.id && !x.cancelled; })
+    .map(function (x) { return pickMedia(have[x.id] || x); });
+  e.media.forEach(function (x) { if (!media.some(function (y) { return y.id === x.id; })) media.push(pickMedia(x)); });
+  var rec = { id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, body: e.body, tags: e.tags.slice(), media: media };
+  var shown = shownRec(rec);
+  if (!e.autoTitle) { shown.title = e.title; shown.autoTitle = false; }
+  upsert(shown);
+  Outbox.add(rec);
+  Uploads.done(ed.id, m);
+}
+
 function saveEditor() {
   if (!ED) return;
   var b = $('#ed-save');
-  if (ED.media.some(function (m) { return m.status === 'prep' || m.status === 'uploading'; })) { toast('Wait for uploads to finish.'); return; }
+  var going = ED.media.filter(function (m) { return m.status === 'prep' || m.status === 'uploading'; });
   var failed = ED.media.filter(function (m) { return m.status === 'error'; }).length;
   if (failed) { toast(plural(failed, 'upload') + ' failed. Tap it to retry, or remove it.', 4500); return; }
   var rec = {
@@ -1667,8 +1745,14 @@ function saveEditor() {
     tags: ED.tags.slice(),
     media: ED.media.filter(function (m) { return m.status === 'done' && m.id; }).map(pickMedia)
   };
-  if (!rec.title && !rec.body.trim() && !rec.media.length) { toast('Write something or add a photo first.'); return; }
+  if (!rec.title && !rec.body.trim() && !rec.media.length && !going.length) { toast('Write something or add a photo first.'); return; }
   var wasNew = ED.isNew;
+  // Photos still uploading carry on in the background and join the entry when done.
+  if (going.length) {
+    ED.saved = true; ED.savedDate = rec.date;
+    going.forEach(function (m) { Uploads.add(rec.id, m); });
+    toast('Saved. ' + (going.length === 1 ? 'The photo keeps' : 'Photos keep') + ' uploading in the background. Keep Diari open until done.', 5000);
+  }
   // Show it straight away; Google Drive gets it in the background.
   upsert(shownRec(rec));
   Outbox.add(rec);
@@ -1696,7 +1780,7 @@ edSheet.addEventListener('click', function (ev) {
   var rt = t.closest('[data-retry]');
   if (rt) {
     var mk = ED.media.find(function (x) { return x.key === rt.getAttribute('data-retry'); });
-    if (mk && mk.file) { mk.status = 'prep'; mk.prog = 0; renderTile(mk); updateSave(); uploadQueue = uploadQueue.then(function () { return processUpload(mk); }); }
+    if (mk && mk.file) { mk.ed = ED; mk.status = 'prep'; mk.prog = 0; renderTile(mk); updateSave(); uploadQueue = uploadQueue.then(function () { return processUpload(mk); }); }
     return;
   }
   var ut = t.closest('[data-untag]');
@@ -1763,14 +1847,14 @@ function wireShell() {
   $('#btn-search').onclick = function () { if ($('#search').hidden) showSearch(); else hideSearch(); };
   $('#q').addEventListener('input', function () { S.query = this.value; if (S.view !== 'timeline') setView('timeline'); else { render(); } });
   $('#btn-settings').onclick = openSettings;
-  $('#fab').onclick = function () { if (!Auth.valid()) { Auth.signIn(false); return; } if (fresh(20)) openEditor(null); };
+  $('#fab').onclick = function () { if (fresh(3, { id: '' })) openEditor(null); };
   $$('.tab').forEach(function (t) { t.onclick = function () { setView(t.getAttribute('data-view')); }; });
 
   view.addEventListener('click', function (ev) {
     var t = ev.target;
     var o = t.closest('[data-open]'); if (o) { openEntry(o.getAttribute('data-open')); return; }
-    if (t.closest('[data-new]')) { if (fresh(20)) openEditor(null); return; }
-    var no = t.closest('[data-new-on]'); if (no) { if (fresh(20)) openEditor(null, no.getAttribute('data-new-on')); return; }
+    if (t.closest('[data-new]')) { if (fresh(3, { id: '' })) openEditor(null); return; }
+    var no = t.closest('[data-new-on]'); if (no) { var nd = no.getAttribute('data-new-on'); if (fresh(3, { id: '', day: nd })) openEditor(null, nd); return; }
     var c = t.closest('[data-cal]');
     if (c) {
       var d = +c.getAttribute('data-cal');
@@ -1871,7 +1955,8 @@ function boot() {
   if (/[?&]new=1/.test(location.search)) { history.replaceState(null, '', location.pathname); lsSet('diari-reopen', { id: '', at: Date.now() }); }
   var cached = lsGet('diari-index');
   var hasCache = !!(cached && cached.length);
-  if (!Auth.valid(10 * 60e3)) {
+  var keepGoing = false;
+  if (!Auth.valid(RENEW_AT)) {
     if (!navigator.onLine && hasCache) {
       document.body.classList.remove('signed-out'); $('#fab').hidden = false;
       Outbox.load();
@@ -1882,12 +1967,13 @@ function boot() {
     var err = Auth.error;
     // Signed in before: get a new Google sign-in without any screens, then come straight back.
     if (Auth.email && !err) { view.innerHTML = '<p class="results" style="text-align:center;margin-top:40px">Signing in…</p>'; Auth.signIn(true); return; }
-    showSignIn(err in AUTH_ERRORS ? AUTH_ERRORS[err] : err);
-    return;
+    // A quiet renewal did not work, but the current sign-in still has a few minutes: carry on with it.
+    if (!(Auth.silentFailed && Auth.valid(3 * 60e3))) { showSignIn(err in AUTH_ERRORS ? AUTH_ERRORS[err] : err); return; }
+    keepGoing = true;
   }
   // Came back from allowing full Drive access: move the earlier journal now.
   if (Auth.full) { runMove(); return; }
-  var authMsg = Auth.error ? (Auth.error in AUTH_ERRORS ? AUTH_ERRORS[Auth.error] : Auth.error) : '';
+  var authMsg = keepGoing ? '' : Auth.error ? (Auth.error in AUTH_ERRORS ? AUTH_ERRORS[Auth.error] : Auth.error) : '';
   $('#fab').hidden = false;
   document.body.classList.remove('signed-out');
   Stream.sendToken();
@@ -1900,8 +1986,11 @@ function boot() {
     S.entries = normList(r.index.entries); sortEntries(); Outbox.overlay();
     S.rootUrl = /^https:\/\/drive\.google\.com\//.test(r.rootUrl || '') ? r.rootUrl : ''; S.aiTitles = r.aiTitles || ''; S.loaded = true; cacheIndex(); render();
     Outbox.run();
-    var re = lsGet('diari-reopen');
-    if (re) { lsDel('diari-reopen'); if (Date.now() - re.at < 30 * 60e3 && (!re.id || byId(re.id))) openEditor(re.id || null); }
+    Uploads.leftover();
+    var rv = lsGet('diari-reopen-view'), re = lsGet('diari-reopen');
+    lsDel('diari-reopen-view'); lsDel('diari-reopen');
+    if (rv && Date.now() - rv.at < 30 * 60e3 && byId(rv.id)) openEntry(rv.id);
+    if (re && Date.now() - re.at < 30 * 60e3 && (!re.id || byId(re.id))) openEditor(re.id || null, re.day || undefined);
     var cr = lsGet('diari-copyresume');
     if (cr) { lsDel('diari-copyresume'); if (Date.now() - cr.at < 30 * 60e3 && Copy.supported()) startCopies(); }
   }).catch(function (err) {

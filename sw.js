@@ -3,7 +3,7 @@
    - Streams videos from Google Drive: the video player asks for stream/<file id>, and this adds the
      Google sign-in and passes the video through piece by piece, so playback starts at once.
    Your journal data is never stored here; it comes from Google Drive. */
-var CACHE = 'diari-v12';
+var CACHE = 'diari-v13';
 var SHELL = ['./', 'index.html', 'app.js', 'store.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-192.png', 'icons/maskable-512.png', 'icons/icon-180.png'];
 var DRIVE = 'https://www.googleapis.com/drive/v3/files/';
