@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v10';
+var APP_VERSION = 'v11';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -687,8 +687,7 @@ function entryHTML(e) {
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
     (e.tags.length ? '<div class="tags">' + e.tags.map(function (t) { return '<button class="chip" data-tag="' + esc(t) + '">#' + esc(t) + '</button>'; }).join('') + '</div>' : '') +
-    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') + (Copies.has(e.id) ? '<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>' : '') +
-    (LIVE && e.fileId ? '<a href="https://drive.google.com/file/d/' + esc(e.fileId) + '/view" target="_blank" rel="noopener">Open file in Google Drive</a>' : '') + '</div>';
+    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') + (Copies.has(e.id) ? '<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>' : '') + '</div>';
 }
 
 function openEntry(id) {
