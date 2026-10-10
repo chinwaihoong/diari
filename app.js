@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v9';
+var APP_VERSION = 'v10';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -778,20 +778,49 @@ var Copy = {
 
 /* One copy at a time, in the background; the entry shows "Preparing video" until it is attached. */
 var Copies = {
-  queue: [], busy: false, active: {},
+  queue: [], busy: false, active: {}, current: null, prog: 0, timer: 0,
   has: function (entryId) { return !!this.active[entryId]; },
+  /** Already waiting or being made, so tapping again never makes a second copy. */
+  queued: function (mediaId) {
+    return !!(this.current && this.current.mediaId === mediaId) || this.queue.some(function (j) { return j.mediaId === mediaId; });
+  },
+  idle: function () { return !this.busy && !this.queue.length; },
   add: function (job) {
+    if (this.queued(job.mediaId)) return false;
     this.queue.push(job);
     this.active[job.entryId] = (this.active[job.entryId] || 0) + 1;
     refreshPending(); this.run();
+    return true;
   },
   paint: function (entryId, pr) {
+    this.prog = pr;
     $$('[data-copy="' + entryId + '"]').forEach(function (x) { x.textContent = 'Preparing video ' + Math.round(pr * 100) + '%'; });
   },
   run: function () {
+    var self = this;
+    clearTimeout(this.timer);
     if (this.busy || !this.queue.length) return;
-    var self = this, job = this.queue.shift();
-    this.busy = true;
+    // A copy takes a few minutes; start only with enough sign-in time left (otherwise sign in again first).
+    if (!Auth.valid(10 * 60e3)) {
+      if (this.queue.some(function (j) { return j.fromFix; })) lsSet('diari-copyresume', { at: Date.now() });   // carry on after signing in
+      if (!ED && navigator.onLine) reauth();
+      this.timer = setTimeout(function () { self.run(); }, 30e3); return;
+    }
+    var job = this.queue.shift();
+    this.busy = true; this.current = job; this.prog = 0;
+    var again = false;
+    var finish = function () {
+      self.busy = false; self.current = null;
+      if (!again && !--self.active[job.entryId]) delete self.active[job.entryId];
+      refreshPending();
+      if (!again && job.done) job.done(job);
+      if (again) self.timer = setTimeout(function () { self.run(); }, 30e3); else self.run();
+    };
+    // Made meanwhile (on the other device, or by an earlier tap): nothing to do.
+    if (job.fromFix) {
+      var e = byId(job.entryId), m = e && e.media.filter(function (x) { return x.id === job.mediaId; })[0];
+      if (!m || m.play) { job.ok = !!m; job.skipped = true; Promise.resolve().then(finish); return; }
+    }
     var getFile = job.file ? Promise.resolve(job.file) : API.blob(job.mediaId);
     getFile.then(function (file) {
       return Copy.make(file, function (pr) { self.paint(job.entryId, pr); if (job.onProg) job.onProg(pr); });
@@ -802,34 +831,57 @@ var Copies = {
     }).then(function (playId) { attachPlay(job, playId); job.ok = true; }, function (err) {
       job.err = errText(err);
       try { console.warn('Diari video copy:', job.err, err); } catch (e) {}
-      if (err && err.expired) { self.queue.unshift(job); self.active[job.entryId]++; }
+      if (err && err.expired) { again = true; self.queue.unshift(job); if (job.fromFix) lsSet('diari-copyresume', { at: Date.now() }); if (!ED) reauth(); }
     }).then(function () {
-      self.busy = false;
-      if (!--self.active[job.entryId]) delete self.active[job.entryId];
-      refreshPending();
-      if (job.done) job.done(job);
-      self.run();
+      if (!again) CopyLog.note(job);
+      finish();
     });
   }
 };
 
+/* What happened to the last copy, shown in Settings so it is easy to tell whether it worked. */
+var CopyLog = {
+  note: function (job) {
+    if (job.skipped) return;
+    lsSet('diari-copylast', { ok: !!job.ok, err: job.ok ? '' : (job.err || 'unknown problem'), at: Date.now() });
+  },
+  last: function () { return lsGet('diari-copylast'); }
+};
+
+/** Moves extra copies to the trash (for example from tapping the button more than once). */
+function tidyCopies() {
+  if (!Copies.idle()) return Promise.resolve({ removed: 0 });
+  var keep = [];
+  var add = function (list) { (list || []).forEach(function (m) { if (m && m.play) keep.push(m.play); }); };
+  S.entries.forEach(function (e) { add(e.media); });
+  Outbox.items.forEach(function (x) { add(x.rec.media); });
+  if (ED) add(ED.media);
+  return API.tidyCopies(keep).catch(function (err) { if (err && err.expired) throw err; return { removed: 0 }; });
+}
+
 function attachPlay(job, playId) {
   if (!job.fromFix && ED && ED.id === job.entryId) {
     var em = ED.media.filter(function (x) { return x.id === job.mediaId; })[0];
-    if (em) { em.play = playId; saveDraft(); return; }
+    if (em) { if (em.play && em.play !== playId) dropCopy(em.play); em.play = playId; saveDraft(); return; }
   }
   var e = byId(job.entryId);
   var has = e && e.media.some(function (x) { return x.id === job.mediaId; });
-  if (!has) { API.discard([{ id: '', thumb: '', preview: '', play: playId }]).catch(function () {}); return; }
+  if (!has) { dropCopy(playId); return; }
   var rec = {
     id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, body: e.body, tags: e.tags.slice(),
-    media: e.media.map(function (x) { var o = pickMedia(x); if (x.id === job.mediaId) o.play = playId; return o; })
+    media: e.media.map(function (x) {
+      var o = pickMedia(x);
+      if (x.id === job.mediaId) { if (o.play && o.play !== playId) dropCopy(o.play); o.play = playId; }
+      return o;
+    })
   };
   var shown = shownRec(rec);
   if (!e.autoTitle) { shown.title = e.title; shown.autoTitle = false; }
   upsert(shown);
   Outbox.add(rec);
 }
+
+function dropCopy(id) { API.discard([{ id: '', thumb: '', preview: '', play: id }]).catch(function () {}); }
 
 function playId(m) { return m.play && !m.noPlay ? m.play : m.id; }
 
@@ -1095,7 +1147,7 @@ function openSettings() {
       '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
       '<pre class="plog" id="photo-log" hidden></pre>' +
       (Copy.supported() ? '<p class="muted" style="margin-top:16px">Videos stop and start on mobile data? Make a smaller 720p copy for smooth playback. The originals stay in your Drive. Best done on Wi-Fi: each original is downloaded once.</p>' +
-        '<button class="btn soft" id="btn-copies">Make videos play smoothly' + (videosNeedingCopy().length ? ' (' + videosNeedingCopy().length + ')' : '') + '</button>' : '') +
+        '<button class="btn soft" id="btn-copies">' + copyLabel() + '</button><p class="copy-status" id="copy-status">' + esc(copyStatus()) + '</p>' : '') +
     '</details>' +
     '<p class="muted" style="margin-top:28px;font-size:12px">Diari ' + APP_VERSION + '</p>';
 
@@ -1150,24 +1202,7 @@ function openSettings() {
     }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Fix black photo previews'; });
   };
   var bc = $('#btn-copies', box);
-  if (bc) bc.onclick = function () {
-    var todo = videosNeedingCopy();
-    if (!todo.length) { toast('All videos already play smoothly.'); return; }
-    var b = this, n = 0, made = 0, failed = 0, label = 'Make videos play smoothly';
-    b.disabled = true;
-    todo.forEach(function (t) {
-      Copies.add({ entryId: t.e.id, mediaId: t.m.id, name: t.e.date.slice(0, 10) + ' ' + (t.m.name || 'video'), date: t.e.date, fromFix: true,
-        onProg: function (pr) { b.textContent = 'Video ' + (n + 1) + ' of ' + todo.length + ' · ' + Math.round(pr * 100) + '%'; },
-        done: function (job) {
-          n++; if (job.ok) made++; else failed++;
-          if (n === todo.length) {
-            b.disabled = false; b.textContent = label;
-            toast(made ? 'Made ' + plural(made, 'smooth copy', 'smooth copies') + (failed ? '. ' + failed + ' could not be made: ' + job.err : '.') : 'Could not make the copies: ' + (job.err || 'unknown problem'), 7000);
-          }
-        } });
-    });
-    b.textContent = 'Video 1 of ' + todo.length + ' · starting…';
-  };
+  if (bc) { bc.disabled = !!CopyRun; bc.onclick = startCopies; }
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
       if (!yes) return;
@@ -1187,6 +1222,56 @@ function showPhotoLog() {
     return (x.name || 'photo') + ' · ' + x.type + ' · ' + (x.size || '?') + ' · ' + x.mb + ' MB → ' + x.result + (x.steps.length ? ' (' + x.steps.join(', ') + ')' : '');
   }).join('\n');
   box.hidden = false;
+}
+
+/* "Make videos play smoothly": one run at a time; the button and the line under it show how far it is. */
+var CopyRun = null;          // { total, n, made, failed, err } while copies are being made from Settings
+function copyLabel() {
+  if (CopyRun) return 'Video ' + Math.min(CopyRun.n + 1, CopyRun.total) + ' of ' + CopyRun.total + ' · ' + (Copies.busy ? (Copies.prog > 0 ? Math.round(Copies.prog * 100) + '%' : 'downloading…') : 'starting…');
+  var need = videosNeedingCopy().length;
+  return 'Make videos play smoothly' + (need ? ' (' + need + ')' : '');
+}
+function copyStatus() {
+  if (CopyRun) return 'Working on it. Keep Diari open until it finishes.';
+  var need = videosNeedingCopy().length, last = CopyLog.last();
+  if (!need) return S.entries.some(function (e) { return e.media.some(function (m) { return m.type === 'video'; }); }) ? 'Done. All videos are ready to play smoothly.' : '';
+  var s = plural(need, 'video') + (need === 1 ? ' does' : ' do') + ' not have a smooth copy yet.';
+  if (last && !last.ok) s += ' Last try: ' + last.err;
+  return s;
+}
+function paintCopyUI() {
+  var b = $('#btn-copies'), st = $('#copy-status');
+  if (b) { b.textContent = copyLabel(); b.disabled = !!CopyRun; }
+  if (st) st.textContent = copyStatus();
+}
+function startCopies() {
+  if (CopyRun) return;
+  var todo = videosNeedingCopy().filter(function (t) { return !Copies.queued(t.m.id); });
+  if (!todo.length) {
+    if (!Copies.idle()) { toast('Already making the smooth copy. Keep Diari open until it finishes.'); return; }
+    toast('Checking…');
+    tidyCopies().then(function (r) {
+      toast('All videos already play smoothly.' + (r.removed ? ' Moved ' + plural(r.removed, 'extra copy', 'extra copies') + ' to the trash.' : ''), 6000);
+    }, fail);
+    return;
+  }
+  var run = CopyRun = { total: todo.length, n: 0, made: 0, failed: 0, err: '' };
+  todo.forEach(function (t) {
+    Copies.add({ entryId: t.e.id, mediaId: t.m.id, name: t.e.date.slice(0, 10) + ' ' + (t.m.name || 'video'), date: t.e.date, fromFix: true,
+      onProg: paintCopyUI,
+      done: function (job) {
+        run.n++; if (job.ok) run.made++; else { run.failed++; run.err = job.err; }
+        if (run.n < run.total) { paintCopyUI(); return; }
+        CopyRun = null; paintCopyUI();
+        var msg = run.made ? 'Made ' + plural(run.made, 'smooth copy', 'smooth copies') + (run.failed ? '. ' + run.failed + ' could not be made: ' + run.err : '.')
+          : 'Could not make the copies: ' + (run.err || 'unknown problem');
+        tidyCopies().then(function (r) {
+          toast(msg + (r.removed ? ' Moved ' + plural(r.removed, 'extra copy', 'extra copies') + ' to the trash.' : ''), 7000);
+          paintCopyUI();
+        }, function () { toast(msg, 7000); });
+      } });
+  });
+  paintCopyUI();
 }
 
 function videosNeedingCopy() {
@@ -1719,6 +1804,8 @@ function boot() {
     Outbox.run();
     var re = lsGet('diari-reopen');
     if (re) { lsDel('diari-reopen'); if (Date.now() - re.at < 30 * 60e3 && (!re.id || byId(re.id))) openEditor(re.id || null); }
+    var cr = lsGet('diari-copyresume');
+    if (cr) { lsDel('diari-copyresume'); if (Date.now() - cr.at < 30 * 60e3 && Copy.supported()) startCopies(); }
   }).catch(function (err) {
     if (err && err.expired) { reauth(); return; }
     if (S.loaded) toast('Couldn’t refresh from Google Drive. Showing the copy on this device.', 5000);

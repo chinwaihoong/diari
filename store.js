@@ -790,6 +790,36 @@ window.DiariStore = {
 
   discard: function (items) { return Promise.all((Array.isArray(items) ? items : []).map(trashMedia)); },
 
+  /** Trashes playback copies no entry uses: extra copies of a video that already has one, and leftovers
+      older than a day (younger ones may still be on their way from the other device). Reads the newest
+      list from Drive first, and only ever touches .play.mp4 files Diari tagged in Journal › Media › Previews. */
+  tidyCopies: function (keep) {
+    return root().then(function (r) {
+      return readIndex(r).then(function (index) {
+        if (!index) return { removed: 0 };
+        var used = {};
+        index.entries.forEach(function (e) { (e.media || []).forEach(function (m) { if (m.play) used[m.play] = 1; }); });
+        (keep || []).forEach(function (id) { if (id) used[id] = 1; });
+        return folder(r, MEDIA_NAME).then(function (media) { return folder(media, PREVIEWS_NAME); }).then(function (prev) {
+          return list("'" + qv(prev) + "' in parents and mimeType = 'video/mp4' and trashed = false", 'id,name,description,createdTime');
+        }).then(function (files) {
+          files = files.filter(function (f) { return /\.play\.mp4$/.test(f.name || '') && String(f.description || '').indexOf(MEDIA_TAG) === 0; });
+          var usedNames = {};
+          files.forEach(function (f) { if (used[f.id]) usedNames[f.name] = 1; });
+          var dayAgo = Date.now() - 864e5;
+          var extra = files.filter(function (f) {
+            if (used[f.id]) return false;
+            var t = Date.parse(f.createdTime || '');
+            return usedNames[f.name] || (t && t < dayAgo);
+          });
+          var removed = 0;
+          return Promise.all(extra.map(function (f) { return trash(f.id).then(function () { removed++; }, function (e) { if (e.expired) throw e; }); }))
+            .then(function () { return { removed: removed }; });
+        });
+      });
+    });
+  },
+
   rebuild: function () { return root().then(rebuildIndex).then(function (idx) { return { entries: idx.entries }; }); },
 
   suggest: function (x) {
