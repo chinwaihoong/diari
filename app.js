@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v8';
+var APP_VERSION = 'v9';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -456,7 +456,7 @@ function normEntry(e) {
     tags: Array.isArray(e.tags) ? e.tags.map(String) : [],
     media: (Array.isArray(e.media) ? e.media : []).filter(function (m) { return m && fid(m.id); }).map(function (m) {
       return { id: fid(m.id), type: m.type === 'video' ? 'video' : 'photo', name: String(m.name || ''), mime: String(m.mime || ''),
-        size: n(m.size), w: n(m.w), h: n(m.h), dur: n(m.dur), thumb: fid(m.thumb), preview: fid(m.preview) };
+        size: n(m.size), w: n(m.w), h: n(m.h), dur: n(m.dur), thumb: fid(m.thumb), preview: fid(m.preview), play: fid(m.play) };
     }),
     created: String(e.created || ''), updated: String(e.updated || ''), fileId: fid(e.fileId)
   };
@@ -508,6 +508,7 @@ function cardHTML(e, sameDay) {
   if (mc.photos) meta.push(plural(mc.photos, 'photo'));
   if (mc.videos) meta.push(plural(mc.videos, 'video'));
   if (e.pending) meta.push('<b class="pend">' + pendingText() + '</b>');
+  if (Copies.has(e.id)) meta.push('<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>');
   return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + '" data-open="' + esc(e.id) + '">' +
     '<span class="dt" aria-hidden="true"><span class="dw">' + DOW[d.getDay()].slice(0, 3) + '</span><span class="dn">' + d.getDate() + '</span></span>' +
     '<span style="min-width:0;display:block">' +
@@ -686,7 +687,7 @@ function entryHTML(e) {
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
     (e.tags.length ? '<div class="tags">' + e.tags.map(function (t) { return '<button class="chip" data-tag="' + esc(t) + '">#' + esc(t) + '</button>'; }).join('') + '</div>' : '') +
-    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') +
+    '<div class="ev-foot"><span>' + foot.join(' · ') + '</span>' + (e.pending ? '<b class="pend">' + pendingText() + '</b>' : '') + (Copies.has(e.id) ? '<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>' : '') +
     (LIVE && e.fileId ? '<a href="https://drive.google.com/file/d/' + esc(e.fileId) + '/view" target="_blank" rel="noopener">Open file in Google Drive</a>' : '') + '</div>';
 }
 
@@ -719,10 +720,123 @@ function ringEl() {
   return r;
 }
 
+/* ---------- Playback copies: a smaller 720p version of each video, made on this device ----------
+   Phone videos carry 15-50 Mbit/s, more than mobile data can stream smoothly. The copy carries about
+   2.5 Mbit/s. The original stays untouched in Drive; Diari plays the copy. */
+var Copy = {
+  lib: null,
+  supported: function () { return !!(window.VideoEncoder && window.VideoDecoder && window.OffscreenCanvas); },
+  /** Worth a copy: bigger than 720p, or more than 5 Mbit/s. */
+  needed: function (m) {
+    if (!m || m.type !== 'video' || m.play) return false;
+    var rate = m.dur && m.size ? m.size * 8 / m.dur : 0;
+    return Math.max(m.w || 0, m.h || 0) > 1300 || rate > 5e6 || (!m.w && (m.size || 0) > 15e6);
+  },
+  load: function () {
+    if (window.Mediabunny) return Promise.resolve(window.Mediabunny);
+    if (Copy.lib) return Copy.lib;
+    Copy.lib = new Promise(function (res, rej) {
+      var sc = document.createElement('script');
+      sc.src = 'vendor/mediabunny.min.js';
+      sc.onload = function () { if (window.Mediabunny) res(window.Mediabunny); else rej(new Error('The video tools did not load.')); };
+      sc.onerror = function () { Copy.lib = null; rej(new Error('The video tools did not load. Check your connection.')); };
+      document.head.appendChild(sc);
+    });
+    return Copy.lib;
+  },
+  /** Resolves a smaller MP4 Blob. */
+  make: function (blob, onProg) {
+    return Copy.load().then(function (MB) {
+      return Promise.all([
+        MB.getFirstEncodableVideoCodec(['avc', 'vp9'], { width: 1280, height: 720 }),
+        MB.getFirstEncodableAudioCodec(['aac', 'opus'], { numberOfChannels: 2, sampleRate: 48000 })
+      ]).then(function (codecs) {
+        if (!codecs[0]) throw new Error('This device cannot make video copies.');
+        var output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new MB.BufferTarget() });
+        return MB.Conversion.init({
+          input: new MB.Input({ source: new MB.BlobSource(blob), formats: MB.ALL_FORMATS }),
+          output: output,
+          video: function (track) {
+            var o = { codec: codecs[0], bitrate: 2500000, keyFrameInterval: 2, forceTranscode: true };
+            if (Math.max(track.displayWidth, track.displayHeight) > 1280) {
+              if (track.displayWidth >= track.displayHeight) o.width = 1280; else o.height = 1280;
+            }
+            return o;
+          },
+          audio: codecs[1] ? { codec: codecs[1] } : { discard: true }
+        }).then(function (conv) {
+          // Losing the picture is never acceptable; losing the sound only when we asked to drop it (no audio encoder).
+          var lost = conv.discardedTracks.filter(function (d) { return codecs[1] || (d.track && d.track.type === 'video'); });
+          if (!conv.isValid || lost.length) throw new Error('This video cannot be copied on this device.');
+          conv.onProgress = function (pr) { if (onProg) onProg(pr); };
+          return conv.execute().then(function () { return new Blob([output.target.buffer], { type: 'video/mp4' }); });
+        });
+      });
+    });
+  }
+};
+
+/* One copy at a time, in the background; the entry shows "Preparing video" until it is attached. */
+var Copies = {
+  queue: [], busy: false, active: {},
+  has: function (entryId) { return !!this.active[entryId]; },
+  add: function (job) {
+    this.queue.push(job);
+    this.active[job.entryId] = (this.active[job.entryId] || 0) + 1;
+    refreshPending(); this.run();
+  },
+  paint: function (entryId, pr) {
+    $$('[data-copy="' + entryId + '"]').forEach(function (x) { x.textContent = 'Preparing video ' + Math.round(pr * 100) + '%'; });
+  },
+  run: function () {
+    if (this.busy || !this.queue.length) return;
+    var self = this, job = this.queue.shift();
+    this.busy = true;
+    var getFile = job.file ? Promise.resolve(job.file) : API.blob(job.mediaId);
+    getFile.then(function (file) {
+      return Copy.make(file, function (pr) { self.paint(job.entryId, pr); if (job.onProg) job.onProg(pr); });
+    }).then(function (blob) {
+      return API.target(job.date).then(function (tgt) {
+        return API.upload(blob, { name: job.name + '.play.mp4', folderId: tgt.previewId, mime: 'video/mp4' });
+      });
+    }).then(function (playId) { attachPlay(job, playId); job.ok = true; }, function (err) {
+      job.err = errText(err);
+      try { console.warn('Diari video copy:', job.err, err); } catch (e) {}
+      if (err && err.expired) { self.queue.unshift(job); self.active[job.entryId]++; }
+    }).then(function () {
+      self.busy = false;
+      if (!--self.active[job.entryId]) delete self.active[job.entryId];
+      refreshPending();
+      if (job.done) job.done(job);
+      self.run();
+    });
+  }
+};
+
+function attachPlay(job, playId) {
+  if (!job.fromFix && ED && ED.id === job.entryId) {
+    var em = ED.media.filter(function (x) { return x.id === job.mediaId; })[0];
+    if (em) { em.play = playId; saveDraft(); return; }
+  }
+  var e = byId(job.entryId);
+  var has = e && e.media.some(function (x) { return x.id === job.mediaId; });
+  if (!has) { API.discard([{ id: '', thumb: '', preview: '', play: playId }]).catch(function () {}); return; }
+  var rec = {
+    id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, body: e.body, tags: e.tags.slice(),
+    media: e.media.map(function (x) { var o = pickMedia(x); if (x.id === job.mediaId) o.play = playId; return o; })
+  };
+  var shown = shownRec(rec);
+  if (!e.autoTitle) { shown.title = e.title; shown.autoTitle = false; }
+  upsert(shown);
+  Outbox.add(rec);
+}
+
+function playId(m) { return m.play && !m.noPlay ? m.play : m.id; }
+
 /* ---------- Videos stream through Diari's offline helper (sw.js), so they start at once ---------- */
 var Stream = {
   ok: function () { return !!(navigator.serviceWorker && navigator.serviceWorker.controller) && Auth.valid(60e3); },
-  url: function (m) { return 'stream/' + encodeURIComponent(m.id) + (m.size ? '?s=' + Math.round(m.size) : ''); },
+  url: function (m) { var id = playId(m); return 'stream/' + encodeURIComponent(id) + (id === m.id && m.size ? '?s=' + Math.round(m.size) : ''); },
   sendToken: function () {
     var c = navigator.serviceWorker && navigator.serviceWorker.controller;
     if (c && Auth.valid(30e3)) c.postMessage({ type: 'token', token: Auth.token, exp: Auth.exp });
@@ -760,10 +874,10 @@ function playInline(tile, m) {
     var spin = spinner();
     tile.classList.add('playing');
     var v = streamVideo(m, posterS && posterS.src, function () {
-      // Streaming didn't work (for example an old phone browser): download the whole video instead.
       v.remove(); spin.remove(); tile.classList.remove('playing');
       if (playBtnS) playBtnS.hidden = false;
-      downloadAndPlay(tile, m);
+      if (m.play && !m.noPlay) { m.noPlay = true; playInline(tile, m); return; }   // copy didn't play: use the original
+      downloadAndPlay(tile, m);                                                      // streaming didn't work: download it
     });
     v.addEventListener('diari-ready', function () { spin.remove(); });
     $$('.badge', tile).forEach(function (b) { b.remove(); });
@@ -778,7 +892,7 @@ function downloadAndPlay(tile, m) {
   tile.classList.add('loading');
   var playBtn = $('.play', tile); if (playBtn) playBtn.hidden = true;
   var ring = ringEl(); tile.appendChild(ring);
-  var ent = Loader.get(m.id, false);
+  var ent = Loader.get(playId(m), false);
   var sub = function (f) { ring.set(f); };
   ent.subs.push(sub); ring.set(ent.prog);
   ent.p.then(function (url) {
@@ -889,7 +1003,8 @@ function openLightbox(items, index, fromMedia) {
       var sp = spinner();
       var sv = streamVideo(m, '', function () {
         if (items[i] !== m) return;
-        m.noStream = true; show();                     // streaming didn't work: download instead
+        if (m.play && !m.noPlay) m.noPlay = true; else m.noStream = true;   // try the original, then downloading
+        show();
       });
       sv.autoplay = true;
       sv.addEventListener('diari-ready', function () { sp.remove(); });
@@ -901,7 +1016,7 @@ function openLightbox(items, index, fromMedia) {
       var posterId = m.preview || m.thumb;
       var ring = ringEl(); stage.appendChild(ring);
       var posterP = posterId ? Loader.get(posterId, true).p.catch(function () { return ''; }) : Promise.resolve('');
-      var ent = Loader.get(m.id, false);
+      var ent = Loader.get(playId(m), false);
       var sub = function (f) { ring.set(f); };
       ent.subs.push(sub); ring.set(ent.prog);
       Promise.all([ent.p, posterP]).then(function (r) {
@@ -979,6 +1094,8 @@ function openSettings() {
       '<p class="muted" style="margin-top:16px">If photos show as black squares, make their previews again from the original photos.</p>' +
       '<button class="btn soft" id="btn-previews">Fix black photo previews</button>' +
       '<pre class="plog" id="photo-log" hidden></pre>' +
+      (Copy.supported() ? '<p class="muted" style="margin-top:16px">Videos stop and start on mobile data? Make a smaller 720p copy for smooth playback. The originals stay in your Drive. Best done on Wi-Fi: each original is downloaded once.</p>' +
+        '<button class="btn soft" id="btn-copies">Make videos play smoothly' + (videosNeedingCopy().length ? ' (' + videosNeedingCopy().length + ')' : '') + '</button>' : '') +
     '</details>' +
     '<p class="muted" style="margin-top:28px;font-size:12px">Diari ' + APP_VERSION + '</p>';
 
@@ -1032,6 +1149,25 @@ function openSettings() {
       showPhotoLog();
     }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Fix black photo previews'; });
   };
+  var bc = $('#btn-copies', box);
+  if (bc) bc.onclick = function () {
+    var todo = videosNeedingCopy();
+    if (!todo.length) { toast('All videos already play smoothly.'); return; }
+    var b = this, n = 0, made = 0, failed = 0, label = 'Make videos play smoothly';
+    b.disabled = true;
+    todo.forEach(function (t) {
+      Copies.add({ entryId: t.e.id, mediaId: t.m.id, name: t.e.date.slice(0, 10) + ' ' + (t.m.name || 'video'), date: t.e.date, fromFix: true,
+        onProg: function (pr) { b.textContent = 'Video ' + (n + 1) + ' of ' + todo.length + ' · ' + Math.round(pr * 100) + '%'; },
+        done: function (job) {
+          n++; if (job.ok) made++; else failed++;
+          if (n === todo.length) {
+            b.disabled = false; b.textContent = label;
+            toast(made ? 'Made ' + plural(made, 'smooth copy', 'smooth copies') + (failed ? '. ' + failed + ' could not be made: ' + job.err : '.') : 'Could not make the copies: ' + (job.err || 'unknown problem'), 7000);
+          }
+        } });
+    });
+    b.textContent = 'Video 1 of ' + todo.length + ' · starting…';
+  };
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
       if (!yes) return;
@@ -1051,6 +1187,12 @@ function showPhotoLog() {
     return (x.name || 'photo') + ' · ' + x.type + ' · ' + (x.size || '?') + ' · ' + x.mb + ' MB → ' + x.result + (x.steps.length ? ' (' + x.steps.join(', ') + ')' : '');
   }).join('\n');
   box.hidden = false;
+}
+
+function videosNeedingCopy() {
+  var out = [];
+  S.entries.forEach(function (e) { if (!e.pending) e.media.forEach(function (m) { if (Copy.needed(m)) out.push({ e: e, m: m }); }); });
+  return out;
 }
 
 /* Remaking photo previews that came out black (made before the fix in October 2026). */
@@ -1194,8 +1336,8 @@ function closeEditor() {
   ED = null;
 }
 
-function pickIds(m) { return { id: m.id, thumb: m.thumb || '', preview: m.preview || '' }; }
-function pickMedia(m) { return { id: m.id, type: m.type, name: m.name, mime: m.mime, size: m.size, w: m.w || 0, h: m.h || 0, dur: m.dur || 0, thumb: m.thumb || '', preview: m.preview || '' }; }
+function pickIds(m) { return { id: m.id, thumb: m.thumb || '', preview: m.preview || '', play: m.play || '' }; }
+function pickMedia(m) { return { id: m.id, type: m.type, name: m.name, mime: m.mime, size: m.size, w: m.w || 0, h: m.h || 0, dur: m.dur || 0, thumb: m.thumb || '', preview: m.preview || '', play: m.play || '' }; }
 
 function saveDraft() {
   if (!ED) return;
@@ -1313,7 +1455,12 @@ function processUpload(m) {
     });
   }).then(function () {
     if (m.cancelled || ED !== ed || ed.media.indexOf(m) < 0) { API.discard([pickIds(m)]).catch(function () {}); return; }
-    m.status = 'done'; m.prog = 1; delete m.file;
+    m.status = 'done'; m.prog = 1;
+    if (m.type === 'video' && Copy.supported() && Copy.needed(m)) {
+      Copies.add({ entryId: ed.id, mediaId: m.id, file: m.file, name: (($('#ed-date').value || localStr(new Date())).slice(0, 10)) + ' ' + m.name,
+        date: $('#ed-date').value || localStr(new Date()) });
+    }
+    delete m.file;
     renderTile(m); updateSave(); saveDraft();
   }).catch(function (err) {
     if (ED !== ed) return;

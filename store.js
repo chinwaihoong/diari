@@ -208,7 +208,7 @@ function trashIfOurs(id) {
     if (String(f.description || '').indexOf(MEDIA_TAG) === 0 && !f.trashed) return trash(id);
   }).catch(function () { /* already gone */ });
 }
-function trashMedia(m) { return Promise.all([m.id, m.thumb, m.preview].map(trashIfOurs)); }
+function trashMedia(m) { return Promise.all([m.id, m.thumb, m.preview, m.play].map(trashIfOurs)); }
 
 /* ================================================================ */
 /* Journal folder, index and settings                               */
@@ -348,7 +348,7 @@ function cleanRec(x) {
       id: okId(m.id), type: m.type === 'video' ? 'video' : 'photo',
       name: String(m.name || '').slice(0, 200), mime: String(m.mime || '').slice(0, 100),
       size: num(m.size), w: num(m.w), h: num(m.h), dur: num(m.dur),
-      thumb: okId(m.thumb), preview: okId(m.preview)
+      thumb: okId(m.thumb), preview: okId(m.preview), play: okId(m.play)
     };
   });
   var seen = {};
