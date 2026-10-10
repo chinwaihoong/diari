@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v11';
+var APP_VERSION = 'v12';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -1035,13 +1035,15 @@ function openLightbox(items, index, fromMedia) {
   function show() {
     var m = items[i];
     stopVideos(stage); stage.innerHTML = '';
+    Z = { s: 1, x: 0, y: 0, img: null, m: m, hi: false };
+    stage.classList.toggle('zoomable', m.type === 'photo'); lb.classList.remove('zoomed');
     $('.lb-count', lb).textContent = items.length > 1 ? (i + 1) + ' / ' + items.length : '';
     $('.lb-cap', lb).textContent = fmtLong(m.date) + (m.title ? ' · ' + m.title : '');
     $('.prev', lb).hidden = i === 0; $('.next', lb).hidden = i === items.length - 1;
     if (m.type === 'photo') {
-      var img = document.createElement('img'); img.alt = m.title || 'Photo';
+      var img = document.createElement('img'); img.alt = m.title || 'Photo'; img.draggable = false;
       var want = m.preview || m.id;
-      stage.appendChild(img);
+      stage.appendChild(img); Z.img = img;
       Loader.get(want, !!m.preview).p.then(function (u) { if (items[i] === m) img.src = u; })
         .catch(function (err) { if (items[i] === m) stage.innerHTML = '<div class="lb-msg">' + esc(errText(err)) + '</div>'; });
       img.onerror = function () {
@@ -1091,22 +1093,119 @@ function openLightbox(items, index, fromMedia) {
   function key(ev) {
     if (ev.key === 'ArrowLeft') go(-1);
     else if (ev.key === 'ArrowRight') go(1);
+    else if (Z.img && (ev.key === '+' || ev.key === '=')) zoomAt({ x: 0, y: 0 }, Z.s * 1.5, true);
+    else if (Z.img && ev.key === '-') zoomAt({ x: 0, y: 0 }, Z.s / 1.5 < 1.25 ? 1 : Z.s / 1.5, true);
   }
   $('[data-x]', lb).onclick = function () { Nav.pop(); };
   $('.prev', lb).onclick = function () { go(-1); };
   $('.next', lb).onclick = function () { go(1); };
   var goBtn = $('[data-go]', lb);
   if (goBtn) goBtn.onclick = function () { var id = items[i].entryId; Nav.pop(); openEntry(id); };
-  var sx = null, sy = 0;
-  stage.addEventListener('pointerdown', function (ev) { if (ev.pointerType !== 'mouse') { sx = ev.clientX; sy = ev.clientY; } });
-  stage.addEventListener('pointerup', function (ev) {
-    if (sx === null) return;
-    var dx = ev.clientX - sx, dy = ev.clientY - sy; sx = null;
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.4) go(dx < 0 ? 1 : -1);
+
+  /* Zoom for photos: pinch or double-tap on a phone, mouse wheel or double-click on a PC.
+     Zoomed in, one finger (or the mouse) moves the photo; zoomed out, a swipe goes to the next one. */
+  var Z = { s: 1, x: 0, y: 0, img: null, m: null, hi: false }, MAX = 6;
+  function box() {
+    var r = stage.getBoundingClientRect();
+    var nw = (Z.img && Z.img.naturalWidth) || r.width, nh = (Z.img && Z.img.naturalHeight) || r.height;
+    var a = nw / nh, cw = Math.min(r.width, r.height * a);
+    return { r: r, cw: cw, ch: cw / a };
+  }
+  function at(cx, cy) { var r = stage.getBoundingClientRect(); return { x: cx - r.left - r.width / 2, y: cy - r.top - r.height / 2 }; }
+  function paint(anim) {
+    if (!Z.img) return;
+    var b = box(), mx = Math.max(0, (b.cw * Z.s - b.r.width) / 2), my = Math.max(0, (b.ch * Z.s - b.r.height) / 2);
+    Z.x = Math.max(-mx, Math.min(mx, Z.x)); Z.y = Math.max(-my, Math.min(my, Z.y));
+    Z.img.style.transition = anim ? 'transform .22s ease' : 'none';
+    Z.img.style.transform = Z.s > 1 ? 'translate(' + Z.x + 'px,' + Z.y + 'px) scale(' + Z.s + ')' : '';
+    lb.classList.toggle('zoomed', Z.s > 1.01);
+    if (Z.s > 1.5) sharpen();
+  }
+  function zoomAt(p, s, anim) {
+    s = Math.max(1, Math.min(MAX, s));
+    var qx = (p.x - Z.x) / Z.s, qy = (p.y - Z.y) / Z.s;
+    Z.s = s; Z.x = s === 1 ? 0 : p.x - qx * s; Z.y = s === 1 ? 0 : p.y - qy * s;
+    paint(anim);
+  }
+  function toggleZoom(cx, cy) { if (Z.s > 1.01) zoomAt({ x: 0, y: 0 }, 1, true); else zoomAt(at(cx, cy), 2.5, true); }
+  // The preview is 1600 px; when zooming in, swap in the full-size original so details stay sharp.
+  function sharpen() {
+    var m = Z.m, img = Z.img;
+    if (Z.hi || !m || !m.preview || !LIVE || !/^image\/(jpeg|png|webp|gif)$/i.test(m.mime || '')) return;
+    Z.hi = true;
+    Loader.get(m.id, false).p.then(function (u) {
+      var pre = new Image();
+      pre.onload = function () { if (Z.img === img) img.src = u; };
+      pre.src = u;
+    }).catch(function () {});
+  }
+
+  var pts = {}, G = null, lastTap = { t: 0, x: 0, y: 0 }, lastType = '';
+  function ids() { return Object.keys(pts); }
+  function begin() {
+    var k = ids(), was = G;
+    if (k.length >= 2) {
+      var a = pts[k[0]], b = pts[k[1]];
+      G = { pinch: true, d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, s0: Z.s, x0: Z.x, y0: Z.y, m0: at((a.x + b.x) / 2, (a.y + b.y) / 2), pinched: true };
+    } else if (k.length === 1) {
+      var p = pts[k[0]];
+      G = { pinch: false, sx: p.x, sy: p.y, x0: Z.x, y0: Z.y, moved: false, mouse: p.mouse, pinched: !!(was && was.pinched) };
+    } else G = null;
+  }
+  stage.addEventListener('pointerdown', function (ev) {
+    lastType = ev.pointerType;
+    if (ev.pointerType === 'mouse' && (ev.button !== 0 || !Z.img || Z.s <= 1.01)) return;   // a mouse only drags a zoomed photo
+    pts[ev.pointerId] = { x: ev.clientX, y: ev.clientY, mouse: ev.pointerType === 'mouse' };
+    if (Z.img) { try { stage.setPointerCapture(ev.pointerId); } catch (e) {} }
+    begin();
   });
-  stage.addEventListener('pointercancel', function () { sx = null; });
+  stage.addEventListener('pointermove', function (ev) {
+    var p = pts[ev.pointerId];
+    if (!p || !G) return;
+    p.x = ev.clientX; p.y = ev.clientY;
+    if (!Z.img) return;
+    if (G.pinch) {
+      var k = ids(), a = pts[k[0]], b = pts[k[1]];
+      var s = Math.max(1, Math.min(MAX, G.s0 * Math.hypot(a.x - b.x, a.y - b.y) / G.d0));
+      var m = at((a.x + b.x) / 2, (a.y + b.y) / 2), qx = (G.m0.x - G.x0) / G.s0, qy = (G.m0.y - G.y0) / G.s0;
+      Z.s = s; Z.x = m.x - qx * s; Z.y = m.y - qy * s;
+      paint(false);
+    } else {
+      var dx = p.x - G.sx, dy = p.y - G.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 8) G.moved = true;
+      if (Z.s > 1.01) { Z.x = G.x0 + dx; Z.y = G.y0 + dy; paint(false); }
+    }
+  });
+  function end(ev) {
+    var p = pts[ev.pointerId];
+    if (!p) return;
+    delete pts[ev.pointerId];
+    var g = G;
+    if (ids().length) { begin(); return; }            // one finger still down after a pinch: carry on moving
+    G = null;
+    if (Z.s > 1 && Z.s <= 1.05) zoomAt({ x: 0, y: 0 }, 1, true);   // nearly zoomed out: settle at the normal size
+    if (!g || g.pinch || ev.type !== 'pointerup') return;
+    var dx = p.x - g.sx, dy = p.y - g.sy;
+    if (!g.moved && !g.pinched && !g.mouse && Z.img) {            // a tap: two in a row zoom in or out
+      var now = Date.now();
+      if (now - lastTap.t < 320 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 40) { lastTap.t = 0; toggleZoom(p.x, p.y); }
+      else lastTap = { t: now, x: p.x, y: p.y };
+      return;
+    }
+    if (Z.s <= 1.01 && !g.pinched && !g.mouse && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.4) go(dx < 0 ? 1 : -1);
+  }
+  stage.addEventListener('pointerup', end);
+  stage.addEventListener('pointercancel', end);
+  stage.addEventListener('dblclick', function (ev) { if (Z.img && lastType === 'mouse') toggleZoom(ev.clientX, ev.clientY); });   // touch double-taps are handled above
+  stage.addEventListener('wheel', function (ev) {
+    if (!Z.img) return;
+    ev.preventDefault();
+    zoomAt(at(ev.clientX, ev.clientY), Z.s * Math.exp(-ev.deltaY * (ev.ctrlKey ? 0.01 : 0.0018)), false);
+  }, { passive: false });
+  function fit() { paint(false); }
+  window.addEventListener('resize', fit);
   document.addEventListener('keydown', key);
-  Nav.push(function () { stopVideos(lb); document.removeEventListener('keydown', key); lb.remove(); lockScroll(); });
+  Nav.push(function () { stopVideos(lb); document.removeEventListener('keydown', key); window.removeEventListener('resize', fit); lb.remove(); lockScroll(); });
   show();
   $('[data-x]', lb).focus();
 }
