@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v16';
+var APP_VERSION = 'v17';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -1497,6 +1497,7 @@ function openEditor(id, presetDay) {
     ED.media = (draft.media || []).map(function (m) { return Object.assign({}, m, { key: rid(8), status: 'done', prog: 1, isNew: !!m.isNew }); });
     setTimeout(function () { toast('Restored your unsaved changes'); }, 350);
   }
+  toggleCal(false);
   renderTray(); renderTags(); updateHint(); updateSave(); autoGrow();
   openSheet(edSheet);
   Nav.stack.pop();                       // replace the plain close with the "unsaved changes" check
@@ -1548,7 +1549,58 @@ function saveDraft() {
 var draftTimer;
 function queueDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(saveDraft, 600); }
 
+/* ---------- Date and time of an entry: Diari's own picker, so a tap on a day is all it takes (no "Set") ---------- */
+var EdCal = { y: 0, m: 0 };
+function whenValue() { return $('#ed-date').value || localStr(new Date()); }
+function setWhen(v) { $('#ed-date').value = v; updateHint(); queueDraft(); }
+function paintWhen() {
+  var v = whenValue(), d = parseD(v);
+  $('#ed-day').textContent = DOW[d.getDay()].slice(0, 3) + ' ' + d.getDate() + ' ' + MON[d.getMonth()].slice(0, 3) + (d.getFullYear() !== new Date().getFullYear() ? ' ' + d.getFullYear() : '');
+  if (document.activeElement !== $('#ed-time')) $('#ed-time').value = v.slice(11, 16);
+  if (!$('#ed-cal').hidden) paintCal();
+}
+function dayStr(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+function shiftDay(n) {
+  var v = whenValue(), d = parseD(v.slice(0, 10));
+  d.setDate(d.getDate() + n);
+  setWhen(dayStr(d) + 'T' + v.slice(11, 16));
+}
+function paintCal() {
+  var sel = whenValue().slice(0, 10), today = todayKey();
+  var first = new Date(EdCal.y, EdCal.m, 1), lead = (first.getDay() + 6) % 7, days = new Date(EdCal.y, EdCal.m + 1, 0).getDate();
+  var h = '<div class="dcal-head"><button type="button" class="icon-btn" data-cmon="-1" aria-label="Previous month">' + I.chevL + '</button>' +
+    '<b>' + MON[EdCal.m] + ' ' + EdCal.y + '</b><button type="button" class="icon-btn" data-cmon="1" aria-label="Next month">' + I.chevR + '</button></div>' +
+    '<div class="dcal-quick"><button type="button" data-dquick="0">Today</button><button type="button" data-dquick="-1">Yesterday</button></div>' +
+    '<div class="dcal-grid">' + ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(function (w) { return '<span>' + w.toUpperCase() + '</span>'; }).join('');
+  for (var i = 0; i < lead; i++) h += '<i></i>';
+  for (var n = 1; n <= days; n++) {
+    var k = EdCal.y + '-' + pad(EdCal.m + 1) + '-' + pad(n);
+    h += '<button type="button" data-dday="' + k + '" class="' + (k === sel ? 'sel' : '') + (k === today ? ' today' : '') + '" aria-label="' + fmtLong(k) + '"' + (k === sel ? ' aria-pressed="true"' : '') + '>' + n + '</button>';
+  }
+  $('#ed-cal').innerHTML = h + '</div>';
+}
+function toggleCal(open) {
+  var cal = $('#ed-cal');
+  if (open == null) open = cal.hidden;
+  if (open) { var d = parseD(whenValue()); EdCal.y = d.getFullYear(); EdCal.m = d.getMonth(); paintCal(); }
+  cal.hidden = !open;
+  $('#ed-day').setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+(function () {
+  $$('.when-step').forEach(function (b) { b.innerHTML = b.getAttribute('data-dstep') === '-1' ? I.chevL : I.chevR; });
+  $('.ed-meta').addEventListener('click', function (ev) {
+    var t = ev.target, x;
+    if ((x = t.closest('[data-dstep]'))) { shiftDay(+x.getAttribute('data-dstep')); return; }
+    if (t.closest('#ed-day')) { toggleCal(); return; }
+    if ((x = t.closest('[data-cmon]'))) { EdCal.m += +x.getAttribute('data-cmon'); if (EdCal.m < 0) { EdCal.m = 11; EdCal.y--; } if (EdCal.m > 11) { EdCal.m = 0; EdCal.y++; } paintCal(); return; }
+    if ((x = t.closest('[data-dquick]'))) { var d = new Date(); d.setDate(d.getDate() + +x.getAttribute('data-dquick')); setWhen(dayStr(d) + 'T' + whenValue().slice(11, 16)); toggleCal(false); return; }
+    if ((x = t.closest('[data-dday]'))) { setWhen(x.getAttribute('data-dday') + 'T' + whenValue().slice(11, 16)); toggleCal(false); return; }
+  });
+  $('#ed-time').addEventListener('change', function () { if (/^\d{2}:\d{2}/.test(this.value)) setWhen(whenValue().slice(0, 10) + 'T' + this.value.slice(0, 5)); });
+})();
+
 function updateHint() {
+  paintWhen();
   var d = $('#ed-date').value || localStr(new Date());
   $('#ed-hint').textContent = LIVE ? 'Saves to Google Drive › Journal › ' + d.slice(0, 4) + ' › ' + d.slice(5, 7) : 'Preview only. Entries here are not saved anywhere.';
 }
