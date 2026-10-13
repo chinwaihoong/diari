@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v14';
+var APP_VERSION = 'v15';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -1562,7 +1562,77 @@ function updateSave() {
   b.textContent = 'Save';
 }
 
-function autoGrow() { var t = $('#ed-body'); t.style.height = 'auto'; t.style.height = Math.max(t.scrollHeight, 200) + 'px'; }
+function autoGrow() {
+  // Measuring briefly shrinks the text box; keep the scroll position so the text doesn't jump behind the keyboard.
+  var t = $('#ed-body'), sb = t.closest('.sheet-body'), st = sb ? sb.scrollTop : 0;
+  t.style.height = 'auto'; t.style.height = Math.max(t.scrollHeight, 200) + 'px';
+  if (sb) sb.scrollTop = st;
+}
+
+/* ---------- The on-screen keyboard ----------
+   Sheets (like the editor) are sized to the part of the screen the keyboard leaves free, so the end of the text
+   can always be scrolled into view. After the phone is locked and unlocked, Android can bring the keyboard back
+   without making room for it, so on leaving Diari the keyboard is put away, and on return the cursor comes back. */
+function fitViewport() {
+  var vv = window.visualViewport, de = document.documentElement;
+  if (!vv || Math.abs(vv.scale - 1) > 0.01) { de.style.removeProperty('--vvh'); de.style.removeProperty('--vvt'); return; }
+  de.style.setProperty('--vvh', Math.round(vv.height) + 'px');
+  de.style.setProperty('--vvt', Math.round(vv.offsetTop) + 'px');
+}
+// Where the cursor sits inside a text box, measured with an invisible copy of it.
+function caretY(t) {
+  var cs = getComputedStyle(t), m = document.createElement('div');
+  ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'letterSpacing', 'wordSpacing', 'paddingTop', 'paddingLeft', 'paddingRight', 'tabSize'].forEach(function (k) { m.style[k] = cs[k]; });
+  m.style.cssText += ';position:absolute;visibility:hidden;left:-9999px;top:0;white-space:pre-wrap;overflow-wrap:break-word;box-sizing:content-box';
+  m.style.width = (t.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)) + 'px';
+  m.textContent = t.value.slice(0, t.selectionEnd == null ? t.value.length : t.selectionEnd);
+  var mark = document.createElement('span'); mark.textContent = '\u200b'; m.appendChild(mark);
+  document.body.appendChild(m);
+  var y = mark.offsetTop + mark.offsetHeight;
+  m.remove();
+  return y;
+}
+// Scrolls the sheet so the cursor (or the field) is above the keyboard.
+function showCaret(el) {
+  var sb = el && el.closest && el.closest('.sheet-body');
+  if (!sb) return;
+  var top = el.getBoundingClientRect().top - sb.getBoundingClientRect().top + sb.scrollTop;
+  var y = top + (el.tagName === 'TEXTAREA' ? caretY(el) : el.offsetHeight);
+  var view = sb.clientHeight;
+  if (y > sb.scrollTop + view - 40) sb.scrollTop = y - view + 96;
+  else if (y < sb.scrollTop + 40) sb.scrollTop = Math.max(0, y - 120);
+}
+function editingField() {
+  var a = document.activeElement;
+  return ED && a && edSheet.contains(a) && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && /^(text|search)$/.test(a.type || 'text'))) ? a : null;
+}
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', function () {
+    fitViewport();
+    var f = editingField(); if (f) requestAnimationFrame(function () { showCaret(f); });
+  });
+  visualViewport.addEventListener('scroll', fitViewport);
+}
+window.addEventListener('resize', fitViewport);
+fitViewport();
+
+var Resume = null;
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) {
+    var f = editingField();
+    if (f) { Resume = { el: f, start: f.selectionStart, end: f.selectionEnd }; saveDraft(); f.blur(); }
+    return;
+  }
+  fitViewport();
+  var r = Resume; Resume = null;
+  if (!r || !ED || !edSheet.contains(r.el)) return;
+  showCaret(r.el);
+  setTimeout(function () {
+    if (!ED || document.hidden || !edSheet.contains(r.el)) return;
+    try { r.el.focus({ preventScroll: true }); r.el.setSelectionRange(r.start, r.end); } catch (e) {}
+    fitViewport(); showCaret(r.el);
+  }, 350);
+});
 
 function tileHTML(m) {
   var img = m.localThumb ? '<img alt="" src="' + esc(m.localThumb) + '">' : (m.thumb ? '<img alt="" class="mimg" data-mid="' + esc(m.thumb) + '">' : '<span class="ph-icon">' + I.image + '</span>');
