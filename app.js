@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v15';
+var APP_VERSION = 'v16';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -45,7 +45,6 @@ var I = {
   addMedia: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>',
   image: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.8"/><path d="m21 15-4.5-4.5L5 21"/></svg>',
   x: '<svg ' + SV + ' stroke-width="2.4"><path d="M17 7 7 17M7 7l10 10"/></svg>',
-  google: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.5a5.6 5.6 0 0 1-2.4 3.6v3h3.9c2.2-2.1 3.5-5.1 3.5-8.7z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 7.9-2.9l-3.9-3c-1.1.7-2.4 1.2-4 1.2-3.1 0-5.7-2.1-6.6-4.9h-4v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.4 14.4a7.2 7.2 0 0 1 0-4.8V6.5h-4a12 12 0 0 0 0 11z"/><path fill="#EA4335" d="M12 4.8c1.7 0 3.3.6 4.6 1.8l3.4-3.4A12 12 0 0 0 1.4 6.5l4 3.1C6.3 6.9 8.9 4.8 12 4.8z"/></svg>',
   spark: '<svg ' + SV + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>'
 };
 
@@ -1998,7 +1997,7 @@ function runMove() {
         '<p>' + (r.none ? (r.existed ? 'Your journal is unchanged.' : 'Diari started a new Journal folder for you.')
           : plural(r.count, 'entry is', 'entries are') + ' in your new Journal folder. The old folder is now called “Journal - old copy”. Delete it in Google Drive once you have checked that everything is here.') + '</p>' +
         '<p>Diari has given up access to the rest of your Drive. Sign in once more to finish.</p>' +
-        '<button class="btn primary" data-signin>' + I.google + 'Sign in to finish</button>');
+        '<button class="btn primary" data-signin>Sign in to finish</button>');
     });
   }).catch(function (err) {
     if (err && err.expired) { Auth.signIn(false, 'move'); return; }
@@ -2015,8 +2014,7 @@ function showSignIn(msg) {
     '<h2>Your journal, kept in your Google Drive</h2>' +
     '<p>Write about your day, add photos and videos, and find it all again by date, tag or word. Entries are saved as files in a Journal folder in your own Google Drive, and Diari can only see the files it creates there.</p>' +
     (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
-    '<button class="btn primary" data-signin>' + I.google + 'Sign in with Google</button>' +
-    '<p class="signin-note">If Google says it hasn’t verified Diari, that is expected for an app you made for yourself: tap <b>Advanced</b>, then <b>Go to Diari</b>.</p></div>';
+    '<button class="btn primary" data-signin>Sign in with Google</button></div>';
 }
 
 function boot() {
