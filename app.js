@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v17';
+var APP_VERSION = 'v18';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -1497,7 +1497,7 @@ function openEditor(id, presetDay) {
     ED.media = (draft.media || []).map(function (m) { return Object.assign({}, m, { key: rid(8), status: 'done', prog: 1, isNew: !!m.isNew }); });
     setTimeout(function () { toast('Restored your unsaved changes'); }, 350);
   }
-  toggleCal(false);
+  toggleCal(false); BodySel = null;
   renderTray(); renderTags(); updateHint(); updateSave(); autoGrow();
   openSheet(edSheet);
   Nav.stack.pop();                       // replace the plain close with the "unsaved changes" check
@@ -1586,17 +1586,33 @@ function toggleCal(open) {
   cal.hidden = !open;
   $('#ed-day').setAttribute('aria-expanded', open ? 'true' : 'false');
 }
+// After the date is picked, go straight back to the text, cursor where it was (or at the end), keyboard up.
+var BodySel = null;
+$('#ed-body').addEventListener('blur', function () { BodySel = [this.selectionStart, this.selectionEnd]; });
+function backToText() {
+  var t = $('#ed-body');
+  if (!ED || !t) return;
+  if (document.activeElement === t) { requestAnimationFrame(function () { showCaret(t); }); return; }   // still typing: leave the cursor be
+  try {
+    t.focus({ preventScroll: true });
+    var n = t.value.length, s = BodySel && BodySel[1] <= n ? BodySel : [n, n];
+    t.setSelectionRange(s[0], s[1]);
+  } catch (e) {}
+  requestAnimationFrame(function () { showCaret(t); });
+}
 (function () {
   $$('.when-step').forEach(function (b) { b.innerHTML = b.getAttribute('data-dstep') === '-1' ? I.chevL : I.chevR; });
+  // The ‹ › buttons don't take the focus, so the keyboard stays up while stepping through days.
+  $$('.when-step').forEach(function (b) { b.addEventListener('mousedown', function (ev) { ev.preventDefault(); }); });
   $('.ed-meta').addEventListener('click', function (ev) {
     var t = ev.target, x;
-    if ((x = t.closest('[data-dstep]'))) { shiftDay(+x.getAttribute('data-dstep')); return; }
+    if ((x = t.closest('[data-dstep]'))) { shiftDay(+x.getAttribute('data-dstep')); backToText(); return; }
     if (t.closest('#ed-day')) { toggleCal(); return; }
     if ((x = t.closest('[data-cmon]'))) { EdCal.m += +x.getAttribute('data-cmon'); if (EdCal.m < 0) { EdCal.m = 11; EdCal.y--; } if (EdCal.m > 11) { EdCal.m = 0; EdCal.y++; } paintCal(); return; }
-    if ((x = t.closest('[data-dquick]'))) { var d = new Date(); d.setDate(d.getDate() + +x.getAttribute('data-dquick')); setWhen(dayStr(d) + 'T' + whenValue().slice(11, 16)); toggleCal(false); return; }
-    if ((x = t.closest('[data-dday]'))) { setWhen(x.getAttribute('data-dday') + 'T' + whenValue().slice(11, 16)); toggleCal(false); return; }
+    if ((x = t.closest('[data-dquick]'))) { var d = new Date(); d.setDate(d.getDate() + +x.getAttribute('data-dquick')); setWhen(dayStr(d) + 'T' + whenValue().slice(11, 16)); toggleCal(false); backToText(); return; }
+    if ((x = t.closest('[data-dday]'))) { setWhen(x.getAttribute('data-dday') + 'T' + whenValue().slice(11, 16)); toggleCal(false); backToText(); return; }
   });
-  $('#ed-time').addEventListener('change', function () { if (/^\d{2}:\d{2}/.test(this.value)) setWhen(whenValue().slice(0, 10) + 'T' + this.value.slice(0, 5)); });
+  $('#ed-time').addEventListener('change', function () { if (/^\d{2}:\d{2}/.test(this.value)) { setWhen(whenValue().slice(0, 10) + 'T' + this.value.slice(0, 5)); backToText(); } });
 })();
 
 function updateHint() {
