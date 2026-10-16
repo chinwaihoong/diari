@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v18';
+var APP_VERSION = 'v19';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -462,6 +462,7 @@ function normEntry(e) {
   return {
     id: String(e.id), date: String(e.date),
     title: String(e.title || ''), body: String(e.body || ''),
+    titleAuto: e.titleAuto === true ? true : e.titleAuto === false ? false : undefined,
     tags: Array.isArray(e.tags) ? e.tags.map(String) : [],
     media: (Array.isArray(e.media) ? e.media : []).filter(function (m) { return m && fid(m.id); }).map(function (m) {
       return { id: fid(m.id), type: m.type === 'video' ? 'video' : 'photo', name: String(m.name || ''), mime: String(m.mime || ''),
@@ -878,7 +879,7 @@ function attachPlay(job, playId) {
   var has = e && e.media.some(function (x) { return x.id === job.mediaId; });
   if (!has) { dropCopy(playId); return; }
   var rec = {
-    id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, body: e.body, tags: e.tags.slice(),
+    id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, titleAuto: e.autoTitle ? undefined : e.titleAuto, body: e.body, tags: e.tags.slice(),
     media: e.media.map(function (x) {
       var o = pickMedia(x);
       if (x.id === job.mediaId) { if (o.play && o.play !== playId) dropCopy(o.play); o.play = playId; }
@@ -1438,7 +1439,7 @@ function fixPreviews(onProg) {
   return chain.then(function () {
     Object.keys(changed).forEach(function (id) {
       var e = changed[id];
-      var rec = { id: e.id, date: e.date, title: e.title, body: e.body, tags: e.tags.slice(), media: e.media.map(pickMedia) };
+      var rec = { id: e.id, date: e.date, title: e.title, titleAuto: e.titleAuto, body: e.body, tags: e.tags.slice(), media: e.media.map(pickMedia) };
       upsert(Object.assign(shownRec(rec), { title: e.title, autoTitle: false }));
       Outbox.add(rec);
     });
@@ -1486,6 +1487,12 @@ function openEditor(id, presetDay) {
   $('#ed-heading').textContent = ex ? 'Edit entry' : 'New entry';
   $('#ed-date').value = date;
   $('#ed-title').value = ex && !ex.autoTitle ? ex.title : '';
+  // A title Claude wrote (or one from before Diari kept track) is rewritten when the text changes.
+  ED.origTitle = ex && !ex.autoTitle ? ex.title : '';
+  ED.titleAuto = !!ED.origTitle && ex.titleAuto !== false;
+  ED.suggested = '';
+  ED.baseBody = ex ? ex.body.replace(/\s+$/, '') : '';
+  ED.baseMedia = ex ? ex.media.map(function (m) { return m.id; }).join(',') : '';
   $('#ed-body').value = ex ? ex.body : '';
   ED.base = edSnapshot();                // what "no changes" looks like
 
@@ -1497,7 +1504,7 @@ function openEditor(id, presetDay) {
     ED.media = (draft.media || []).map(function (m) { return Object.assign({}, m, { key: rid(8), status: 'done', prog: 1, isNew: !!m.isNew }); });
     setTimeout(function () { toast('Restored your unsaved changes'); }, 350);
   }
-  toggleCal(false); BodySel = null;
+  toggleCal(false); BodySel = null; paintTitleHint();
   renderTray(); renderTags(); updateHint(); updateSave(); autoGrow();
   openSheet(edSheet);
   Nav.stack.pop();                       // replace the plain close with the "unsaved changes" check
@@ -1860,7 +1867,7 @@ function attachUpload(ed, m) {
   var media = ed.media.filter(function (x) { return x.status === 'done' && x.id && !x.cancelled; })
     .map(function (x) { return pickMedia(have[x.id] || x); });
   e.media.forEach(function (x) { if (!media.some(function (y) { return y.id === x.id; })) media.push(pickMedia(x)); });
-  var rec = { id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, body: e.body, tags: e.tags.slice(), media: media };
+  var rec = { id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, titleAuto: e.autoTitle ? undefined : e.titleAuto, body: e.body, tags: e.tags.slice(), media: media };
   var shown = shownRec(rec);
   if (!e.autoTitle) { shown.title = e.title; shown.autoTitle = false; }
   upsert(shown);
@@ -1874,10 +1881,19 @@ function saveEditor() {
   var going = ED.media.filter(function (m) { return m.status === 'prep' || m.status === 'uploading'; });
   var failed = ED.media.filter(function (m) { return m.status === 'error'; }).length;
   if (failed) { toast(plural(failed, 'upload') + ' failed. Tap it to retry, or remove it.', 4500); return; }
+  var typed = $('#ed-title').value.trim(), titleAuto = false, keepShown = '';
+  if (!typed) titleAuto = true;                                     // Claude writes one
+  else if (ED.titleAuto && typed === ED.origTitle) {
+    var body0 = $('#ed-body').value.replace(/\s+$/, '');
+    var media0 = ED.media.filter(function (m) { return m.status === 'done' && m.id; }).map(function (m) { return m.id; }).join(',');
+    if (body0 !== ED.baseBody || media0 !== ED.baseMedia) { typed = ''; keepShown = ED.origTitle; }   // text changed: a fresh title
+    titleAuto = true;
+  } else if (ED.suggested && typed === ED.suggested) titleAuto = true;
   var rec = {
     id: ED.id,
     date: $('#ed-date').value || localStr(new Date()),
-    title: $('#ed-title').value.trim(),
+    title: typed,
+    titleAuto: titleAuto,
     body: $('#ed-body').value.replace(/\s+$/, ''),
     tags: ED.tags.slice(),
     media: ED.media.filter(function (m) { return m.status === 'done' && m.id; }).map(pickMedia)
@@ -1891,7 +1907,9 @@ function saveEditor() {
     toast('Saved. ' + (going.length === 1 ? 'The photo keeps' : 'Photos keep') + ' uploading in the background. Keep Diari open until done.', 5000);
   }
   // Show it straight away; Google Drive gets it in the background.
-  upsert(shownRec(rec));
+  var shown = shownRec(rec);
+  if (keepShown) shown.title = keepShown;            // the old title until Claude's new one arrives
+  upsert(shown);
   Outbox.add(rec);
   lsDel('diari-draft');
   ED.force = true; Nav.pop();
@@ -1932,7 +1950,7 @@ $('#ed-suggest').addEventListener('click', function () {
   API.suggest({ body: body, date: $('#ed-date').value || localStr(new Date()), tags: ED.tags.slice(), media: media })
     .then(function (r) {
       if (!ED) return;
-      $('#ed-title').value = r.title || ''; queueDraft();
+      $('#ed-title').value = r.title || ''; ED.suggested = r.title || ''; paintTitleHint(); queueDraft();
       if (r.note) toast(r.note, 7000);
     })
     .catch(function (err) { fail(err); })
@@ -1940,7 +1958,11 @@ $('#ed-suggest').addEventListener('click', function () {
 });
 $('#ed-file').addEventListener('change', function () { if (this.files && this.files.length && ED) addFiles(this.files); this.value = ''; });
 $('#ed-body').addEventListener('input', function () { autoGrow(); queueDraft(); });
-$('#ed-title').addEventListener('input', queueDraft);
+$('#ed-title').addEventListener('input', function () { queueDraft(); paintTitleHint(); });
+function paintTitleHint() {
+  var h = $('#ed-title-hint'); if (!h) return;
+  h.hidden = !(ED && ED.titleAuto && ED.origTitle && $('#ed-title').value.trim() === ED.origTitle);
+}
 $('#ed-title').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('#ed-body').focus(); } });
 $('#ed-date').addEventListener('change', function () { updateHint(); queueDraft(); });
 $('#ed-tag-in').addEventListener('keydown', function (ev) {

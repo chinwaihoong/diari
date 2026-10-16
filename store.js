@@ -357,6 +357,7 @@ function cleanRec(x) {
   return {
     id: String(x.id), date: String(x.date),
     title: String(x.title || '').trim().slice(0, 200),
+    titleAuto: x.titleAuto === true ? true : x.titleAuto === false ? false : undefined,
     body: String(x.body || '').replace(/\r\n?/g, '\n').replace(/\s+$/, ''),
     tags: tags, media: media
   };
@@ -374,10 +375,11 @@ function cleanStored(e) {
 
 function toMarkdown(r) {
   var lines = ['---',
-    'id: ' + JSON.stringify(r.id), 'date: ' + JSON.stringify(r.date), 'title: ' + JSON.stringify(r.title),
-    'tags: ' + JSON.stringify(r.tags), 'media: ' + JSON.stringify(r.media),
+    'id: ' + JSON.stringify(r.id), 'date: ' + JSON.stringify(r.date), 'title: ' + JSON.stringify(r.title)]
+    .concat(typeof r.titleAuto === 'boolean' ? ['titleAuto: ' + r.titleAuto] : [])
+    .concat(['tags: ' + JSON.stringify(r.tags), 'media: ' + JSON.stringify(r.media),
     'created: ' + JSON.stringify(r.created || ''), 'updated: ' + JSON.stringify(r.updated || ''),
-    '---', '', r.body || ''];
+    '---', '', r.body || '']);
   if (r.media.length) {
     lines.push('', '', ATTACH_MARK);
     r.media.forEach(function (m) {
@@ -400,7 +402,7 @@ function fromMarkdown(text, fileId) {
   });
   var body = m[2], cut = body.indexOf(ATTACH_MARK);
   if (cut >= 0) body = body.slice(0, cut);
-  return cleanStored({ id: meta.id, date: meta.date, title: meta.title, body: body.replace(/^\n+/, ''), tags: meta.tags, media: meta.media,
+  return cleanStored({ id: meta.id, date: meta.date, title: meta.title, titleAuto: meta.titleAuto, body: body.replace(/^\n+/, ''), tags: meta.tags, media: meta.media,
     created: meta.created, updated: meta.updated, fileId: fileId });
 }
 
@@ -737,7 +739,7 @@ window.DiariStore = {
   save: function (input) {
     var rec = cleanRec(input), note = '';
     // Claude's title, the index and the month folder are fetched at the same time.
-    var titled = rec.title ? Promise.resolve() : makeTitle(rec).then(function (t) { rec.title = t.title; note = t.note; });
+    var titled = rec.title ? Promise.resolve() : makeTitle(rec).then(function (t) { rec.title = t.title; rec.titleAuto = true; note = t.note; });
     return root().then(function (r) {
       var monthP = folder(r, rec.date.slice(0, 4)).then(function (y) { return folder(y, rec.date.slice(5, 7)); });
       var indexP = readIndex(r).then(function (idx) { return idx || rebuildIndex(r); });
@@ -745,6 +747,7 @@ window.DiariStore = {
         var index = got[0], monthNow = got[1];
         var i = index.entries.findIndex(function (e) { return e.id === rec.id; });
         var prev = i >= 0 ? index.entries[i] : null, now = new Date().toISOString();
+        if (rec.titleAuto === undefined && prev && typeof prev.titleAuto === 'boolean' && prev.title === rec.title) rec.titleAuto = prev.titleAuto;
         rec.created = prev && prev.created ? prev.created : now;
         rec.updated = now;
         var name = fileName(rec), text = toMarkdown(rec);
@@ -840,7 +843,7 @@ window.DiariStore = {
         todo.forEach(function (e) {
           chain = chain.then(function () { return makeTitle(e); }).then(function (t) {
             if (t.note) note = t.note;
-            e.title = t.title; count++;
+            e.title = t.title; e.titleAuto = true; count++;
             if (e.fileId) return updateFile(e.fileId, toMarkdown(e), { name: fileName(e) }).catch(function (err) { if (err.expired) throw err; });
           });
         });

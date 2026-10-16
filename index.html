@@ -256,6 +256,7 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
 .add-tile svg{width:24px;height:24px}
 .ed-title-row{display:flex;align-items:center;gap:6px}
 .ed-title-row .ed-title{flex:1;min-width:0}
+.title-hint{font-size:12.5px;color:var(--faint);margin:-2px 0 6px}
 .suggest{flex:none;height:36px;padding:0 12px 0 10px;border-radius:10px;border:0;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:13px;display:inline-flex;align-items:center;gap:5px;cursor:pointer}
 .suggest svg{width:16px;height:16px}
 .suggest:disabled{opacity:.6;cursor:default}
@@ -382,6 +383,7 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
       <input id="ed-title" class="ed-title" placeholder="Title (optional)" maxlength="200" autocomplete="off">
       <button class="suggest" id="ed-suggest" type="button" aria-label="Suggest a title from what you wrote"></button>
     </div>
+    <p class="title-hint" id="ed-title-hint" hidden>Title by Claude. It updates when you change the text; type your own to keep it.</p>
     <label class="sr" for="ed-body">Entry</label>
     <textarea id="ed-body" class="ed-body" placeholder="What happened today?"></textarea>
     <div class="ed-tags" id="ed-tags"><input id="ed-tag-in" placeholder="Add a tag" autocomplete="off" enterkeyhint="done" aria-label="Add a tag"></div>
