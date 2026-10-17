@@ -890,6 +890,16 @@ window.DiariStore = {
     });
   },
 
+  /** The first bytes of a file (where a photo keeps its EXIF details: date, camera, location). */
+  readStart: function (id, bytes) {
+    if (!okId(id)) return Promise.reject(new Error('Not a Drive file.'));
+    return driveFetch(DRIVE + '/files/' + encodeURIComponent(id) + '?alt=media', { headers: { Range: 'bytes=0-' + ((bytes || 131072) - 1) } })
+      .then(function (r) {
+        if (r.status !== 200 && r.status !== 206) return driveError(r).then(function (m) { var e = new Error(m); e.status = r.status; throw e; });
+        return r.arrayBuffer();
+      });
+  },
+
   load: function (id, onProg, persist) {
     var cached = persist ? IDB.get(id) : Promise.resolve(null);
     return cached.then(function (blob) {

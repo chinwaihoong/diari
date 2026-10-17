@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v20';
+var APP_VERSION = 'v21';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -535,7 +535,7 @@ function cardHTML(e, sameDay) {
   if (e.pending) meta.push('<b class="pend">' + pendingText() + '</b>');
   if (Copies.has(e.id)) meta.push('<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>');
   if (Uploads.count(e.id)) meta.push('<b class="pend">' + Uploads.text(e.id) + '</b>');
-  return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + '" data-open="' + esc(e.id) + '">' +
+  return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + (e.id === S.flashId ? ' justsaved' : '') + '" data-open="' + esc(e.id) + '">' +
     '<span class="dt" aria-hidden="true"><span class="dw">' + DOW[d.getDay()].slice(0, 3) + '</span><span class="dn">' + d.getDate() + '</span></span>' +
     '<span style="min-width:0;display:block">' +
       (e.title ? '<span class="c-title">' + esc(e.title) + '</span>' : '') +
@@ -1276,6 +1276,8 @@ function openSettings() {
       '<pre class="plog" id="photo-log" hidden></pre>' +
       (Copy.supported() ? '<p class="muted" style="margin-top:16px">Videos stop and start on mobile data? Make a smaller 720p copy for smooth playback. The originals stay in your Drive. Best done on Wi-Fi: each original is downloaded once.</p>' +
         '<button class="btn soft" id="btn-copies">' + copyLabel() + '</button><p class="copy-status" id="copy-status">' + esc(copyStatus()) + '</p>' : '') +
+      '<p class="muted" style="margin-top:16px">See which photos carry a location from the camera (read from the original photos in your Drive; nothing is changed).</p>' +
+      '<button class="btn soft" id="btn-locs">Check photo locations</button><div class="loc-log" id="loc-log" hidden></div>' +
     '</details>' +
     '<p class="muted" style="margin-top:28px;font-size:12px">Diari ' + APP_VERSION + '</p>';
 
@@ -1331,6 +1333,7 @@ function openSettings() {
   };
   var bc = $('#btn-copies', box);
   if (bc) { bc.disabled = !!CopyRun; bc.onclick = startCopies; }
+  $('#btn-locs', box).onclick = checkLocations;
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
       if (!yes) return;
@@ -1400,6 +1403,79 @@ function startCopies() {
       } });
   });
   paintCopyUI();
+}
+
+/* ---------- Photo locations: read the GPS tag a camera writes into a photo (EXIF), if it is still there ---------- */
+function exifGps(buf) {
+  var v = new DataView(buf), n = v.byteLength;
+  if (n < 4 || v.getUint16(0) !== 0xFFD8) return { kind: 'other' };
+  var p = 2;
+  while (p + 4 <= n) {
+    if (v.getUint8(p) !== 0xFF) break;
+    var mk = v.getUint8(p + 1);
+    if (mk === 0xD9 || mk === 0xDA) break;
+    var len = v.getUint16(p + 2);
+    if (mk === 0xE1 && p + 10 <= n && v.getUint32(p + 4) === 0x45786966 && v.getUint16(p + 8) === 0) {
+      try { return { kind: 'jpeg', gps: tiffGps(v, p + 10, Math.min(n, p + 2 + len)) }; } catch (e) { return { kind: 'jpeg', gps: null }; }
+    }
+    p += 2 + len;
+  }
+  return { kind: 'jpeg', gps: null };
+}
+function tiffGps(v, t, end) {
+  var le = v.getUint16(t) === 0x4949;
+  var ok = function (o, k) { return t + o + k <= end; };
+  var u16 = function (o) { if (!ok(o, 2)) throw 0; return v.getUint16(t + o, le); };
+  var u32 = function (o) { if (!ok(o, 4)) throw 0; return v.getUint32(t + o, le); };
+  var ifd = u32(4), gpsAt = 0, cnt = u16(ifd);
+  for (var i = 0; i < cnt && i < 200; i++) { var e = ifd + 2 + i * 12; if (u16(e) === 0x8825) { gpsAt = u32(e + 8); break; } }
+  if (!gpsAt) return null;
+  var g = {}, gc = u16(gpsAt);
+  for (var k = 0; k < gc && k < 64; k++) {
+    var ge = gpsAt + 2 + k * 12, tag = u16(ge), type = u16(ge + 2), count = u32(ge + 4);
+    if (tag === 1 || tag === 3) g[tag] = String.fromCharCode(v.getUint8(t + ge + 8));
+    if ((tag === 2 || tag === 4) && type === 5 && count === 3) {
+      var o = u32(ge + 8), x = 0;
+      for (var q = 0; q < 3; q++) { var num = u32(o + q * 8), den = u32(o + q * 8 + 4); x += (den ? num / den : 0) / Math.pow(60, q); }
+      g[tag] = x;
+    }
+  }
+  if (g[2] == null || g[4] == null || (!g[2] && !g[4])) return null;       // 0,0 means it was wiped
+  return { lat: g[2] * (g[1] === 'S' ? -1 : 1), lng: g[4] * (g[3] === 'W' ? -1 : 1) };
+}
+function checkLocations() {
+  var b = this, log = $('#loc-log');
+  var list = [];
+  S.entries.forEach(function (e) { e.media.forEach(function (m) { if (m.type === 'photo') list.push({ e: e, m: m }); }); });
+  if (!list.length) { toast('No photos in your journal yet.'); return; }
+  b.disabled = true;
+  var done = 0, out = new Array(list.length), i = 0;
+  function one(x) {
+    var heic = /hei[cf]/i.test(x.m.mime || '') || /\.hei[cf]$/i.test(x.m.name || '');
+    if (heic) return Promise.resolve({ st: 'heic' });
+    return API.readStart(x.m.id, 131072).then(function (buf) {
+      var r = exifGps(buf);
+      return r.kind !== 'jpeg' ? { st: 'none' } : r.gps ? { st: 'gps', gps: r.gps } : { st: 'none' };
+    }, function (err) { if (err && err.expired) throw err; return { st: 'err' }; });
+  }
+  function worker() {
+    if (i >= list.length) return Promise.resolve();
+    var k = i++;
+    return one(list[k]).then(function (r) { out[k] = r; done++; b.textContent = 'Checking ' + done + ' of ' + list.length + '…'; }).then(worker);
+  }
+  Promise.all([worker(), worker(), worker(), worker()]).then(function () {
+    var have = out.filter(function (r) { return r.st === 'gps'; }).length;
+    var heic = out.filter(function (r) { return r.st === 'heic'; }).length;
+    var rows = list.map(function (x, k) {
+      var r = out[k], where = r.st === 'gps' ? '<a href="https://www.google.com/maps?q=' + r.gps.lat.toFixed(5) + ',' + r.gps.lng.toFixed(5) + '" target="_blank" rel="noopener">' + r.gps.lat.toFixed(4) + ', ' + r.gps.lng.toFixed(4) + '</a>'
+        : r.st === 'heic' ? 'HEIC photo: not checked' : r.st === 'err' ? 'could not be read' : 'no location';
+      return '<li><b>' + esc(fmtDayMonth(x.e.date)) + '</b> · ' + esc(x.e.title || x.m.name || 'Photo') + '<br><span>' + where + '</span></li>';
+    });
+    log.innerHTML = '<p><b>' + have + ' of ' + plural(list.length, 'photo') + '</b> ' + (have === 1 ? 'has' : 'have') + ' a location.' +
+      (heic ? ' ' + heic + ' HEIC ' + (heic === 1 ? 'photo was' : 'photos were') + ' not checked.' : '') +
+      (have < list.length - heic ? ' A photo has no location when the camera\'s location setting was off, or when the phone removed it while sharing the photo.' : '') + '</p><ul>' + rows.join('') + '</ul>';
+    log.hidden = false;
+  }).catch(fail).then(function () { b.disabled = false; b.textContent = 'Check photo locations'; });
 }
 
 function videosNeedingCopy() {
@@ -1927,10 +2003,25 @@ function saveEditor() {
   upsert(shown);
   Outbox.add(rec);
   lsDel('diari-draft');
-  ED.force = true; Nav.pop();
-  render();
-  if (S.openId === rec.id) fillEntry(byId(rec.id));
-  else if (wasNew) setTimeout(function () { openEntry(rec.id); }, 120);
+  ED.force = true; Nav.pop();                                          // close the editor
+  if (entrySheet.classList.contains('open')) Nav.pop();               // and the entry it was opened from
+  S.calPicked = false;
+  setView('timeline');                                                // back to the timeline, the entry highlighted
+  justSaved(rec.id);
+}
+
+// Briefly tints the entry just saved in the timeline, and scrolls to it if it is out of view.
+var flashTimer;
+function justSaved(id) {
+  S.flashId = id; render();
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(function () { S.flashId = ''; $$('.card.justsaved').forEach(function (c) { c.classList.remove('justsaved'); }); }, 2500);
+  requestAnimationFrame(function () {
+    var c = $('.card[data-open="' + id + '"]');
+    if (!c) return;
+    var r = c.getBoundingClientRect();
+    if (r.top < 80 || r.bottom > innerHeight - 140) c.scrollIntoView({ block: 'center' });
+  });
 }
 
 edSheet.addEventListener('click', function (ev) {
