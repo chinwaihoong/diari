@@ -9,12 +9,12 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v19';
+var APP_VERSION = 'v20';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
 
-var S = { entries: [], view: 'timeline', query: '', cal: '', calDay: '', rootUrl: '', aiTitles: '', loaded: false, openId: null };
+var S = { entries: [], view: 'timeline', query: '', cal: '', calDay: '', calPicked: false, rootUrl: '', aiTitles: '', loaded: false, openId: null };
 
 var $ = function (s, el) { return (el || document).querySelector(s); };
 var $$ = function (s, el) { return Array.prototype.slice.call((el || document).querySelectorAll(s)); };
@@ -489,13 +489,28 @@ function counts(list) {
 var view = $('#view');
 
 function setView(v) {
+  if (v !== S.view) S.calPicked = false;
   S.view = v;
   $$('.tab').forEach(function (t) { if (t.getAttribute('data-view') === v) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current'); });
   render();
   window.scrollTo(0, 0);
 }
 
+function fabDay() { return S.view === 'calendar' && S.calPicked && S.calDay && S.calDay !== todayKey() ? S.calDay : ''; }
+function paintFab() {
+  var f = $('#fab'), d = fabDay();
+  if (!f) return;
+  var want = d ? 'day:' + d : 'plain';
+  if (f.getAttribute('data-mode') === want) return;
+  f.setAttribute('data-mode', want);
+  f.classList.toggle('withday', !!d);
+  if (d) { var x = parseD(d + 'T00:00'); f.innerHTML = I.plus + '<span>' + x.getDate() + ' ' + MON[x.getMonth()].slice(0, 3) + '</span>'; }
+  else f.innerHTML = I.plus;
+  f.setAttribute('aria-label', d ? 'New entry for ' + fmtDayMonth(d + 'T00:00') : 'New entry');
+}
+
 function render() {
+  paintFab();
   if (!S.loaded) return;
   if (S.view === 'calendar') renderCalendar();
   else if (S.view === 'media') renderMedia();
@@ -613,7 +628,7 @@ function renderCalendar() {
   var sel = (byDay[S.calDay] || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
   html += '<div class="day-list"><h3>' + esc(fmtDayMonth(S.calDay + 'T00:00')) + '</h3>';
   if (sel.length) html += sel.map(function (e, i) { return cardHTML(e, false); }).join('');
-  else html += '<p class="none">No entry on this day.</p><button class="btn soft" data-new-on="' + S.calDay + '">' + I.plus + 'Write one for this day</button>';
+  else html += '<p class="none">No entry on this day. Tap + to write one.</p>';
   html += '</div>';
   view.innerHTML = html;
 }
@@ -1499,7 +1514,7 @@ function openEditor(id, presetDay) {
   var draft = lsGet('diari-draft');
   if (draft && draft.for === (ex ? ex.id : 'new') && Date.now() - draft.at < 14 * 864e5) {
     if (!ex) ED.id = draft.id || ED.id;
-    $('#ed-date').value = draft.date || date; $('#ed-title').value = draft.title || ''; $('#ed-body').value = draft.body || '';
+    $('#ed-date').value = presetDay && !ex ? presetDay + (draft.date || date).slice(10) : (draft.date || date); $('#ed-title').value = draft.title || ''; $('#ed-body').value = draft.body || '';
     ED.tags = draft.tags || ED.tags;
     ED.media = (draft.media || []).map(function (m) { return Object.assign({}, m, { key: rid(8), status: 'done', prog: 1, isNew: !!m.isNew }); });
     setTimeout(function () { toast('Restored your unsaved changes'); }, 350);
@@ -2006,7 +2021,8 @@ function wireShell() {
   $('#btn-search').onclick = function () { if ($('#search').hidden) showSearch(); else hideSearch(); };
   $('#q').addEventListener('input', function () { S.query = this.value; if (S.view !== 'timeline') setView('timeline'); else { render(); } });
   $('#btn-settings').onclick = openSettings;
-  $('#fab').onclick = function () { if (fresh(3, { id: '' })) openEditor(null); };
+  // On the calendar, + writes for the day picked there.
+  $('#fab').onclick = function () { var d = fabDay(); if (fresh(3, { id: '', day: d })) openEditor(null, d || undefined); };
   $$('.tab').forEach(function (t) { t.onclick = function () { setView(t.getAttribute('data-view')); }; });
 
   view.addEventListener('click', function (ev) {
@@ -2019,9 +2035,9 @@ function wireShell() {
       var d = +c.getAttribute('data-cal');
       if (!d) S.cal = todayKey().slice(0, 7);
       else { var y = +S.cal.slice(0, 4), mo = +S.cal.slice(5, 7) - 1 + d; var nd = new Date(y, mo, 1); S.cal = nd.getFullYear() + '-' + pad(nd.getMonth() + 1); }
-      S.calDay = ''; render(); return;
+      S.calDay = ''; S.calPicked = false; render(); return;
     }
-    var day = t.closest('[data-day]'); if (day) { S.calDay = day.getAttribute('data-day'); render(); return; }
+    var day = t.closest('[data-day]'); if (day) { S.calDay = day.getAttribute('data-day'); S.calPicked = true; render(); return; }
     var mi = t.closest('[data-mi]'); if (mi) { openLightbox(allMedia(), +mi.getAttribute('data-mi'), true); return; }
     if (t.closest('[data-install]')) { Install.prompt(); return; }
     if (t.closest('[data-install-hide]')) { lsSet('diari-install-hidden', 1); render(); return; }

@@ -132,6 +132,8 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
 .tab[aria-current="page"]{color:var(--accent)}
 .fab{position:fixed;z-index:31;right:max(16px,calc((100vw - var(--col)) / 2 + 16px));bottom:calc(var(--nav) + 16px + env(safe-area-inset-bottom,0px));width:60px;height:60px;border-radius:20px;border:0;background:var(--accent);color:var(--accent-ink);box-shadow:var(--shadow);display:grid;place-items:center;cursor:pointer}
 .fab svg{width:28px;height:28px}
+.fab.withday{width:auto;padding:0 20px 0 16px;display:flex;align-items:center;gap:6px;font:700 16px var(--ui);border-radius:20px}
+.fab.withday svg{width:24px;height:24px}
 
 /* sheets */
 .sheet{position:fixed;inset:0;top:var(--vvt,0px);bottom:auto;height:var(--vvh,100%);z-index:40;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);visibility:hidden;transition:transform .28s cubic-bezier(.2,.8,.2,1),visibility 0s linear .28s;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
