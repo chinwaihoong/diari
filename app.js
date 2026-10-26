@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v23';
+var APP_VERSION = 'v24';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -1363,7 +1363,7 @@ function openSettings() {
   $('#btn-signout', box).onclick = function () {
     confirmDlg({ title: 'Sign out on this device?', text: 'Your journal stays in Google Drive. The copy saved on this device is removed.', ok: 'Sign out', danger: true }).then(function (yes) {
       if (!yes) return;
-      API.signOut().then(function () { location.replace(location.pathname); });
+      Promise.all([API.signOut(), Pend.clear()]).then(function () { location.replace(location.pathname); });
     });
   };
   if (!$('#sheet-settings').classList.contains('open')) openSheet($('#sheet-settings'));
@@ -1631,6 +1631,96 @@ var Awake = {
 };
 document.addEventListener('visibilitychange', function () { if (!document.hidden) Awake.check(); });
 
+/* Photos and videos not yet in Google Drive are kept on this device (in the browser's storage) until
+   they are. If Diari is closed, or the phone stops it, they carry on the next time it opens. */
+var Pend = (function () {
+  var dbp = null;
+  function db() {
+    if (!dbp) dbp = new Promise(function (res) {
+      try {
+        var r = indexedDB.open('diari-uploads', 1);
+        r.onupgradeneeded = function () { r.result.createObjectStore('u', { keyPath: 'key' }); };
+        r.onsuccess = function () { res(r.result); };
+        r.onerror = r.onblocked = function () { res(null); };
+      } catch (e) { res(null); }
+    });
+    return dbp;
+  }
+  /** Runs fn(store) in one transaction; resolves with what fn returns (an IDBRequest's result), or null if it failed. */
+  function run(mode, fn) {
+    return db().then(function (d) {
+      if (!d) return null;
+      return new Promise(function (res) {
+        try {
+          var t = d.transaction('u', mode), q = fn(t.objectStore('u'));
+          t.oncomplete = function () { res(q && 'result' in q ? q.result : true); };
+          t.onerror = t.onabort = function (ev) { if (ev && ev.preventDefault) ev.preventDefault(); res(null); };
+        } catch (e) { res(null); }
+      });
+    });
+  }
+  return {
+    keep: function (m, ed) {
+      return run('readwrite', function (st) {
+        return st.put({ key: m.key, edId: ed.id, saved: false, type: m.type, name: m.name, mime: m.mime, size: m.size, fp: m.fp || '',
+          date: edDate(ed), file: m.file, sess: null, got: {}, fails: 0, at: Date.now() });
+      });
+    },
+    patch: function (key, fields) {
+      return run('readwrite', function (st) {
+        var g = st.get(key);
+        g.onsuccess = function () { if (g.result) st.put(Object.assign(g.result, fields)); };
+        return null;
+      });
+    },
+    drop: function (key) { return run('readwrite', function (st) { return st.delete(key); }); },
+    all: function () { return run('readonly', function (st) { return st.getAll(); }).then(function (l) { return l || []; }); },
+    clear: function () { return run('readwrite', function (st) { return st.clear(); }); }
+  };
+})();
+
+/** A kept upload, ready to carry on. */
+function fromKept(r, ed) {
+  return { key: r.key, type: r.type, name: r.name, mime: r.mime, size: r.size, fp: r.fp, file: r.file, pos: r.pos,
+    sess: r.sess ? Promise.resolve(r.sess) : null, got: Object.assign({}, r.got || {}), fails: r.fails || 0,
+    status: 'queued', prog: 0, isNew: true, ed: ed, kept: true };
+}
+
+/** At start: uploads of saved entries that did not finish carry on. Resolves with how many, per entry. */
+function resumeUploads() {
+  return Pend.all().then(function (list) {
+    var draft = lsGet('diari-draft'), eds = {}, n = 0, per = {};
+    list.sort(function (a, b) { return (a.pos || 0) - (b.pos || 0) || a.at - b.at; }).forEach(function (r) {
+      if (!r.file || Date.now() - r.at > 14 * 864e5) { Pend.drop(r.key); return; }
+      if (!r.saved) { if (!draft || draft.id !== r.edId) Pend.drop(r.key); return; }      // the unsaved entry it belonged to is gone
+      var e = byId(r.entryId);
+      if (!e) { Pend.drop(r.key); return; }                                             // the entry was deleted
+      if (e.media.some(function (x) { return x.fp && x.fp === r.fp; })) { Pend.drop(r.key); return; }   // it made it after all
+      var ed = eds[r.entryId] || (eds[r.entryId] = { id: r.entryId, saved: true, savedDate: r.savedDate || e.date, media: [], resumed: true });
+      var m = fromKept(r, ed);
+      ed.media.push(m); Uploads.add(ed.id, m); UpQ.add(m);
+      n++; per[ed.id] = (per[ed.id] || 0) + 1;
+    });
+    if (n) toast('Carrying on with ' + plural(n, 'photo or video', 'photos and videos') + ' that had not finished uploading.', 5000);
+    return per;
+  });
+}
+
+/** Opening the unsaved entry again: its photos and videos that were still uploading come back and carry on. */
+function restoreKept(ed) {
+  Pend.all().then(function (list) {
+    if (ED !== ed) return;
+    var add = list.filter(function (r) {
+      if (r.saved || r.edId !== ed.id || !r.file) return false;
+      if (ed.media.some(function (m) { return m.fp && m.fp === r.fp && m.status === 'done'; })) { Pend.drop(r.key); return false; }   // it made it after all
+      return !ed.media.some(function (m) { return m.key === r.key; });
+    });
+    if (!add.length) return;
+    add.sort(function (a, b) { return a.at - b.at; }).forEach(function (r) { var m = fromKept(r, ed); ed.media.push(m); UpQ.add(m); });
+    renderTray(); updateSave();
+  });
+}
+
 /** At most four uploads are started in Google Drive at the same time. */
 var Gate = {
   n: 0, q: [], MAX: 4,
@@ -1657,7 +1747,7 @@ function startSessions(m) {
       ]);
     }).then(function (l) { return { orig: l[0], thumb: l[1], preview: l[2] }; });
   });
-  p.catch(function () { if (m.sess === p) m.sess = null; });       // the next try starts again
+  p.then(function (s) { Pend.patch(m.key, { sess: s }); }, function () { if (m.sess === p) m.sess = null; });   // a failed start: the next try starts again
   return p;
 }
 
@@ -1727,6 +1817,7 @@ function openEditor(id, presetDay) {
   }
   toggleCal(false); BodySel = null; paintTitleHint();
   renderTray(); renderTags(); updateHint(); updateSave(); autoGrow();
+  restoreKept(ED);
   openSheet(edSheet);
   Nav.stack.pop();                       // replace the plain close with the "unsaved changes" check
   Nav.stack.push(editorBack);
@@ -1748,7 +1839,7 @@ function editorBack() {
     .then(function (yes) {
       if (!yes) return;
       var fresh = ED.media.filter(function (m) { return m.isNew; });
-      fresh.forEach(function (m) { m.cancelled = true; });
+      fresh.forEach(function (m) { m.cancelled = true; Pend.drop(m.key); });
       var done = fresh.filter(function (m) { return m.status === 'done'; }).map(pickIds);
       API.discard(done).catch(function () {});
       lsDel('diari-draft');
@@ -2041,6 +2132,7 @@ function addFiles(files) {
       if (m.type === 'photo') m.localThumb = URL.createObjectURL(f);
       if (m.type === 'video' && f.size > 500e6) toast('Large video (' + fmtSize(f.size) + '). Uploading will take a while.', 4500);
       ed.media.push(m);
+      Pend.keep(m, ed);                   // kept on this device until it is in Drive
       m.sess = startSessions(m);          // now, while the Google sign-in is fresh
       UpQ.add(m);
     });
@@ -2073,7 +2165,7 @@ function processUpload(m) {
     var up = function (k, blob, loc, prog) {
       if (got[k]) return Promise.resolve(got[k]);
       if (!blob) return Promise.resolve('');
-      return API.send(loc, blob, prog).then(function (id) { got[k] = id; return id; });
+      return API.send(loc, blob, prog, m.kept).then(function (id) { got[k] = id; Pend.patch(m.key, { got: Object.assign({}, got) }); return id; });
     };
     return Promise.all([
       up('id', m.file, s.orig, function (f) { setProg(m, 0.04 + f * 0.92); }),
@@ -2088,6 +2180,7 @@ function processUpload(m) {
     delete m.file;
     if (ed.saved && ED !== ed) attachUpload(ed, m);              // saved already: add it to the entry
     else { renderTile(m); updateSave(); saveDraft(); }
+    Pend.drop(m.key);
     if (m.type === 'video' && Copy.supported() && Copy.needed(m)) {
       Copies.add({ entryId: ed.id, mediaId: m.id, file: file, name: edDate(ed).slice(0, 10) + ' ' + m.name, date: edDate(ed) });
     }
@@ -2100,7 +2193,13 @@ function processUpload(m) {
       UpQ.retryLater(m, 8e3 * m.tries * (window.DIARI_TIME || 1));
       return;
     }
-    discardGot(m); m.sess = null;
+    if (ed.saved && ED !== ed && (m.fails = (m.fails || 0) + 1) < 3) {       // keep it on the device and try again next time
+      m.status = 'error'; Uploads.done(ed.id, m); Pend.patch(m.key, { fails: m.fails });
+      var en = byId(ed.id);
+      toast((m.type === 'video' ? 'A video' : 'A photo') + ' for “' + (en ? en.title : 'your entry') + '” could not be uploaded yet: ' + errText(err) + ' Diari tries again the next time it opens.', 8000);
+      return;
+    }
+    discardGot(m); m.sess = null; Pend.drop(m.key);
     if (ed.saved && ED !== ed) {
       m.status = 'error';
       Uploads.done(ed.id, m);
@@ -2135,15 +2234,18 @@ var Uploads = {
   },
   // Kept on the device so that, if Diari is closed before they finish, it can say so next time.
   keep: function () { if (this.any()) lsSet('diari-uploading', { n: this.n, at: Date.now() }); else lsDel('diari-uploading'); },
-  leftover: function () {
-    var x = lsGet('diari-uploading'); lsDel('diari-uploading');
+  /** What was still uploading when Diari was last closed (read once, at start). */
+  take: function () { var x = lsGet('diari-uploading'); lsDel('diari-uploading'); return x; },
+  /** Says which of those could not carry on (resumed: how many did, per entry). */
+  leftover: function (x, resumed) {
     if (!x || !x.n || Date.now() - x.at > 14 * 864e5) return;
+    resumed = resumed || {};
     Object.keys(x.n).forEach(function (id) {
-      var c = x.n[id] || {}, e = byId(id), parts = [];
-      if (c.photo) parts.push(plural(c.photo, 'photo'));
-      if (c.video) parts.push(plural(c.video, 'video'));
-      if (!parts.length) return;
-      toast(parts.join(' and ') + ' for “' + (e ? e.title : 'an entry') + '” did not finish uploading because Diari was closed. Open the entry and add ' + (c.photo + c.video === 1 ? 'it' : 'them') + ' again.', 10000);
+      var c = x.n[id] || {}, e = byId(id), lost = (c.photo || 0) + (c.video || 0) - (resumed[id] || 0), parts = [];
+      if (lost <= 0) return;
+      if (resumed[id]) parts.push(plural(lost, 'photo or video', 'photos and videos'));
+      else { if (c.photo) parts.push(plural(c.photo, 'photo')); if (c.video) parts.push(plural(c.video, 'video')); }
+      toast(parts.join(' and ') + ' for “' + (e ? e.title : 'an entry') + '” did not finish uploading because Diari was closed. Open the entry and add ' + (lost === 1 ? 'it' : 'them') + ' again.', 10000);
     });
   }
 };
@@ -2154,12 +2256,18 @@ window.addEventListener('beforeunload', function (ev) {
 function attachUpload(ed, m) {
   var e = byId(ed.id);
   if (!e) { Uploads.done(ed.id, m); API.discard([pickIds(m)]).catch(function () {}); return; }      // entry deleted meanwhile
-  var have = {};
+  var have = {}, media;
   e.media.forEach(function (x) { have[x.id] = x; });
-  // Keep the order the photos were added in the editor.
-  var media = ed.media.filter(function (x) { return x.status === 'done' && x.id && !x.cancelled; })
-    .map(function (x) { return pickMedia(have[x.id] || x); });
-  e.media.forEach(function (x) { if (!media.some(function (y) { return y.id === x.id; })) media.push(pickMedia(x)); });
+  if (ed.resumed) {
+    // Carried on after Diari was closed: back in the place it had in the entry.
+    media = e.media.map(pickMedia);
+    if (!have[m.id]) media.splice(Math.min(m.pos >= 0 ? m.pos : media.length, media.length), 0, pickMedia(m));
+  } else {
+    // Keep the order the photos were added in the editor.
+    media = ed.media.filter(function (x) { return x.status === 'done' && x.id && !x.cancelled; })
+      .map(function (x) { return pickMedia(have[x.id] || x); });
+    e.media.forEach(function (x) { if (!media.some(function (y) { return y.id === x.id; })) media.push(pickMedia(x)); });
+  }
   var rec = { id: e.id, date: e.date, title: e.autoTitle ? '' : e.title, titleAuto: e.autoTitle ? undefined : e.titleAuto, body: e.body, tags: e.tags.slice(), media: media };
   var shown = shownRec(rec);
   if (!e.autoTitle) { shown.title = e.title; shown.autoTitle = false; }
@@ -2196,8 +2304,8 @@ function saveEditor() {
   // Photos still uploading carry on in the background and join the entry when done.
   if (going.length) {
     ED.saved = true; ED.savedDate = rec.date;
-    going.forEach(function (m) { Uploads.add(rec.id, m); });
-    toast('Saved. ' + (going.length === 1 ? 'The photo keeps' : 'Photos keep') + ' uploading in the background. Keep Diari open until done.', 5000);
+    going.forEach(function (m) { Uploads.add(rec.id, m); Pend.patch(m.key, { saved: true, entryId: rec.id, pos: ED.media.indexOf(m), savedDate: rec.date }); });
+    toast('Saved. ' + (going.length === 1 ? 'The photo keeps' : 'Photos keep') + ' uploading in the background. If you close Diari, ' + (going.length === 1 ? 'it carries' : 'they carry') + ' on when you open it again.', 5000);
   }
   // Show it straight away; Google Drive gets it in the background.
   var shown = shownRec(rec);
@@ -2236,7 +2344,7 @@ edSheet.addEventListener('click', function (ev) {
     var key = rm.getAttribute('data-rm'), m = ED.media.find(function (x) { return x.key === key; });
     if (!m) return;
     ED.media.splice(ED.media.indexOf(m), 1);
-    if (m.isNew) { m.cancelled = true; if (m.status === 'done') API.discard([pickIds(m)]).catch(function () {}); }
+    if (m.isNew) { m.cancelled = true; Pend.drop(m.key); if (m.status === 'done') API.discard([pickIds(m)]).catch(function () {}); }
     renderTray(); updateSave(); queueDraft();
     return;
   }
@@ -2453,7 +2561,8 @@ function boot() {
     S.entries = normList(r.index.entries); sortEntries(); Outbox.overlay();
     S.rootUrl = /^https:\/\/drive\.google\.com\//.test(r.rootUrl || '') ? r.rootUrl : ''; S.aiTitles = r.aiTitles || ''; S.loaded = true; cacheIndex(); render();
     Outbox.run();
-    Uploads.leftover();
+    var left = Uploads.take();
+    resumeUploads().then(function (per) { Uploads.leftover(left, per); });
     var rv = lsGet('diari-reopen-view'), re = lsGet('diari-reopen');
     lsDel('diari-reopen-view'); lsDel('diari-reopen');
     if (rv && Date.now() - rv.at < 30 * 60e3 && byId(rv.id)) openEntry(rv.id);

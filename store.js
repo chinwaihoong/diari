@@ -575,7 +575,7 @@ function xhrSend(method, url, headers, body, onProg) {
 /** Sends a file to a resumable upload. After a dropped connection it asks Drive how much arrived and
     carries on from there. No Google sign-in is needed for this part, so it keeps going after the
     sign-in runs out. Resolves with the new file's id. */
-function sendResumable(loc, blob, onProg) {
+function sendResumable(loc, blob, onProg, ask) {
   var size = blob.size, off = 0, fails = 0, seenRange = false;
   function prog(sent) { if (onProg && size) onProg(Math.min(1, (off + sent) / size)); }
   function acked(r, fallback) {                    // where to carry on, from Drive's "Range: bytes=0-N"
@@ -602,7 +602,10 @@ function sendResumable(loc, blob, onProg) {
     return backoff(fails).then(function () { return xhrSend('PUT', loc, { 'Content-Range': 'bytes */' + size }, null); })
       .then(function (res) { return answer(res, off); }, retry);
   }
-  return size ? chunk() : xhrSend('PUT', loc, { 'Content-Range': 'bytes */0' }, null).then(finished);
+  if (!size) return xhrSend('PUT', loc, { 'Content-Range': 'bytes */0' }, null).then(finished);
+  // Started before Diari was closed: first ask Drive how much it already has.
+  if (ask) return xhrSend('PUT', loc, { 'Content-Range': 'bytes */' + size }, null).then(function (res) { return answer(res, 0); }, retry);
+  return chunk();
 }
 
 /** Starts a resumable upload (needs the Google sign-in). size may be left out. */
@@ -998,7 +1001,7 @@ window.DiariStore = {
 
   /** Starts an upload now, while the Google sign-in is fresh; send() can finish it any time within a week. */
   startUpload: function (meta, size) { return startUpload(meta, meta.mime || 'application/octet-stream', size); },
-  send: function (loc, blob, onProg) { return sendResumable(loc, blob, onProg); },
+  send: function (loc, blob, onProg, ask) { return sendResumable(loc, blob, onProg, ask); },
   whenOnline: whenOnline,
 
   /** The first bytes of a file (where a photo keeps its EXIF details: date, camera, location). */
