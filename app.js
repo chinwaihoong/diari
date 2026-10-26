@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v22';
+var APP_VERSION = 'v23';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -45,6 +45,7 @@ var I = {
   addMedia: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>',
   image: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.8"/><path d="m21 15-4.5-4.5L5 21"/></svg>',
   x: '<svg ' + SV + ' stroke-width="2.4"><path d="M17 7 7 17M7 7l10 10"/></svg>',
+  ext: '<svg ' + SV + '><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"/></svg>',
   spark: '<svg ' + SV + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>'
 };
 
@@ -467,7 +468,7 @@ function normEntry(e) {
     tags: Array.isArray(e.tags) ? e.tags.map(String) : [],
     media: (Array.isArray(e.media) ? e.media : []).filter(function (m) { return m && fid(m.id); }).map(function (m) {
       return { id: fid(m.id), type: m.type === 'video' ? 'video' : 'photo', name: String(m.name || ''), mime: String(m.mime || ''),
-        size: n(m.size), w: n(m.w), h: n(m.h), dur: n(m.dur), thumb: fid(m.thumb), preview: fid(m.preview), play: fid(m.play) };
+        size: n(m.size), w: n(m.w), h: n(m.h), dur: n(m.dur), thumb: fid(m.thumb), preview: fid(m.preview), play: fid(m.play), fp: String(m.fp || '') };
     }),
     created: String(e.created || ''), updated: String(e.updated || ''), fileId: fid(e.fileId)
   };
@@ -1244,6 +1245,19 @@ function openLightbox(items, index, fromMedia) {
 }
 
 /* ---------- settings ---------- */
+var BILLING_URL = 'https://platform.claude.com/settings/billing', creditCheckedAt = 0;
+function usd(v) { return v < 0.01 ? 'less than US$0.01' : 'about US$' + v.toFixed(2); }
+/** Claude does not let apps read the credit balance: link to where it is shown, and say what Diari has used. */
+function creditHTML() {
+  var u = API.claudeUse(), low = API.creditLow();
+  var spent = !u.n ? 'Diari has not used Claude on this device this month.'
+    : 'This month on this device, Claude wrote ' + plural(u.n, 'title') + (u.unpriced && !u.usd ? '.' : ', costing ' + usd(u.usd) + '.');
+  return '<div class="credit" id="credit">' +
+    (low ? '<p class="credit-low"><b>Your Claude credit has run out.</b> New entries get their first sentence as the title until you top up.</p>' : '') +
+    '<p class="muted">Your balance is shown on the Claude Console billing page (Claude does not share it with apps). Top up there, or turn on auto-reload so it never runs out.</p>' +
+    '<p><a class="btn soft" href="' + BILLING_URL + '" target="_blank" rel="noopener">' + I.ext + 'Check balance and top up</a></p>' +
+    '<p class="muted credit-use">' + esc(spent) + '</p></div>';
+}
 function openSettings() {
   var c = counts(S.entries), box = $('#settings-in');
   var untitled = S.entries.filter(function (e) { return !e.title; }).length;
@@ -1263,6 +1277,7 @@ function openSettings() {
         '<div class="key-row"><label class="sr" for="claude-key">Claude API key</label><input id="claude-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">' +
         '<button class="btn primary" id="btn-key-save">Save key</button></div>') +
     (untitled ? '<p style="margin-top:12px"><button class="btn soft" id="btn-titles">' + I.spark + 'Add titles to ' + plural(untitled, 'untitled entry', 'untitled entries') + '</button></p>' : '') +
+    (S.aiTitles ? '<h3>Claude credit</h3>' + creditHTML() : '') +
     '<h3>Install</h3>' +
     (standalone ? '<p class="muted">Diari is installed on this device.</p>'
       : (Install.ev ? '<p><button class="btn primary" id="btn-install">Install Diari</button></p><p class="muted">Adds Diari to your home screen and app list. It opens full screen, like any other app.</p>'
@@ -1298,6 +1313,14 @@ function openSettings() {
       b.disabled = false; b.innerHTML = I.spark + 'Add titles to ' + plural(untitled, 'untitled entry', 'untitled entries');
     });
   };
+  if (S.aiTitles && API.creditLow() && Date.now() - creditCheckedAt > 60e3) {   // topped up since? (a one-word request)
+    creditCheckedAt = Date.now();
+    API.checkCredit().then(function (ok) {
+      if (!ok) return;
+      toast('Your Claude credit is back. Claude writes the titles again.', 5000);
+      var c = $('#credit'); if (c) c.outerHTML = creditHTML();
+    }).catch(function () {});
+  }
   var ks = $('#btn-key-save', box);
   if (ks) ks.onclick = function () {
     var b = this, v = $('#claude-key', box).value.trim();
@@ -1740,7 +1763,7 @@ function closeEditor() {
 }
 
 function pickIds(m) { return { id: m.id, thumb: m.thumb || '', preview: m.preview || '', play: m.play || '' }; }
-function pickMedia(m) { return { id: m.id, type: m.type, name: m.name, mime: m.mime, size: m.size, w: m.w || 0, h: m.h || 0, dur: m.dur || 0, thumb: m.thumb || '', preview: m.preview || '', play: m.play || '' }; }
+function pickMedia(m) { return { id: m.id, type: m.type, name: m.name, mime: m.mime, size: m.size, w: m.w || 0, h: m.h || 0, dur: m.dur || 0, thumb: m.thumb || '', preview: m.preview || '', play: m.play || '', fp: m.fp || '' }; }
 
 function saveDraft() {
   if (!ED) return;
@@ -1954,17 +1977,76 @@ function kindOf(f) {
   return 'photo';
 }
 
+function retryUpload(m) {
+  m.ed = ED; m.status = 'queued'; m.prog = 0; m.tries = 0; renderTile(m); updateSave();
+  if (!m.sess) m.sess = startSessions(m);
+  UpQ.add(m);
+}
+
+/** A fingerprint of a photo or video: its size and a hash of its first and last 64 KB. */
+function fingerprint(f) {
+  var n = f.size, k = 65536;
+  var part = n <= 2 * k ? f : new Blob([f.slice(0, k), f.slice(n - k)]);
+  return Promise.resolve().then(function () { return part.arrayBuffer(); })
+    .then(function (b) { return crypto.subtle.digest('SHA-256', b); })
+    .then(function (h) { return 'v1:' + n + ':' + Array.prototype.map.call(new Uint8Array(h).slice(0, 16), function (x) { return ('0' + x.toString(16)).slice(-2); }).join(''); })
+    .catch(function () { return ''; });
+}
+/** The same photo or video? By fingerprint; for ones added before Diari kept fingerprints, by name and size. */
+function sameMedia(a, b) {
+  if (a.fp && b.fp) return a.fp === b.fp;
+  return !!a.name && a.name === b.name && a.size > 0 && Math.round(a.size) === Math.round(b.size);
+}
+/** The first other entry that already has this photo or video. */
+function journalHas(c, exceptId) {
+  for (var i = 0; i < S.entries.length; i++) {
+    var e = S.entries[i];
+    if (e.id !== exceptId && e.media.some(function (m) { return sameMedia(m, c); })) return e;
+  }
+  return null;
+}
+function countKinds(list) {
+  var p = list.filter(function (x) { return x.type === 'photo'; }).length, v = list.length - p;
+  return [p ? plural(p, 'photo') : '', v ? plural(v, 'video') : ''].filter(Boolean).join(' and ');
+}
+
+/** Adds picked photos and videos, leaving out any already in this entry, and asking about any already in another entry. */
 function addFiles(files) {
-  Array.prototype.forEach.call(files, function (f) {
-    var m = { key: rid(8), type: kindOf(f), name: f.name || (kindOf(f) === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, status: 'queued', prog: 0, file: f, isNew: true, ed: ED };
-    if (m.type === 'photo') m.localThumb = URL.createObjectURL(f);
-    if (m.type === 'video' && f.size > 500e6) toast('Large video (' + fmtSize(f.size) + '). Uploading will take a while.', 4500);
-    ED.media.push(m);
-    m.sess = startSessions(m);          // now, while the Google sign-in is fresh
-    UpQ.add(m);
+  var ed = ED, list = Array.prototype.slice.call(files);
+  if (!ed || !list.length) return;
+  Promise.all(list.map(fingerprint)).then(function (fps) {
+    if (ED !== ed) return;
+    var take = [], here = [], elsewhere = [], where = [];
+    list.forEach(function (f, i) {
+      var c = { f: f, name: f.name || '', size: f.size, fp: fps[i], type: kindOf(f) };
+      var had = ed.media.filter(function (m) { return !m.cancelled && sameMedia(m, c); })[0];
+      if (had && had.status === 'error' && had.file) { retryUpload(had); return; }      // picked again after it failed: try again
+      if (had || take.concat(elsewhere).some(function (x) { return sameMedia(x, c); })) { here.push(c); return; }
+      var e = journalHas(c, ed.id);
+      if (e) { elsewhere.push(c); if (where.indexOf(e) < 0) where.push(e); } else take.push(c);
+    });
+    if (here.length) toast((here.length === 1 ? 'This ' + here[0].type + ' is' : countKinds(here) + ' are') + ' already in this entry, so ' + (here.length === 1 ? 'it was' : 'they were') + ' not added again.', 5000);
+    if (!elsewhere.length) return take;
+    var first = where[0], one = elsewhere.length === 1;
+    var text = (one ? 'This ' + elsewhere[0].type + ' is' : countKinds(elsewhere) + ' are') + ' already in “' + first.title + '” (' + fmtDayMonth(first.date) + ')' +
+      (where.length > 1 ? ' and ' + plural(where.length - 1, 'other entry', 'other entries') : '') + '. Add ' + (one ? 'it' : 'them') + ' to this entry too?';
+    return confirmDlg({ title: 'Already in your journal', text: text, ok: one ? 'Add again' : 'Add them again', cancel: 'Skip' }).then(function (yes) {
+      return yes ? take.concat(elsewhere).sort(function (a, b) { return list.indexOf(a.f) - list.indexOf(b.f); }) : take;
+    });
+  }).then(function (take) {
+    if (!take || !take.length || ED !== ed) return;
+    take.forEach(function (c) {
+      var f = c.f;
+      var m = { key: rid(8), type: c.type, name: f.name || (c.type === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, fp: c.fp, status: 'queued', prog: 0, file: f, isNew: true, ed: ed };
+      if (m.type === 'photo') m.localThumb = URL.createObjectURL(f);
+      if (m.type === 'video' && f.size > 500e6) toast('Large video (' + fmtSize(f.size) + '). Uploading will take a while.', 4500);
+      ed.media.push(m);
+      m.sess = startSessions(m);          // now, while the Google sign-in is fresh
+      UpQ.add(m);
+    });
+    renderTray(); updateSave(); queueDraft();
+    var tray = $('#ed-tray'); tray.scrollLeft = tray.scrollWidth;
   });
-  renderTray(); updateSave();
-  var tray = $('#ed-tray'); tray.scrollLeft = tray.scrollWidth;
 }
 
 /** The entry's date: from the editor while it is open, or as saved (uploads carry on after Save). */
@@ -2161,7 +2243,7 @@ edSheet.addEventListener('click', function (ev) {
   var rt = t.closest('[data-retry]');
   if (rt) {
     var mk = ED.media.find(function (x) { return x.key === rt.getAttribute('data-retry'); });
-    if (mk && mk.file) { mk.ed = ED; mk.status = 'queued'; mk.prog = 0; mk.tries = 0; renderTile(mk); updateSave(); if (!mk.sess) mk.sess = startSessions(mk); UpQ.add(mk); }
+    if (mk && mk.file) retryUpload(mk);
     return;
   }
   var ut = t.closest('[data-untag]');

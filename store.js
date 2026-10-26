@@ -26,6 +26,7 @@ var INDEX_NAME = 'journal-index.json', SETTINGS_NAME = 'diari-settings.json';
 var MEDIA_TAG = 'Journal attachment';            // set on every uploaded file; only these are ever trashed
 var ATTACH_MARK = '<!-- journal:attachments -->';
 var ID_RE = /^[A-Za-z0-9_-]{10,}$/;
+var FP_RE = /^v1:\d+:[0-9a-f]{32}$/;
 
 function lsGet(k) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
@@ -344,12 +345,14 @@ function cleanRec(x) {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(String(x.date))) throw new Error('The entry date is not valid.');
   var num = function (v) { var n = Number(v); return isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
   var media = (Array.isArray(x.media) ? x.media : []).filter(function (m) { return m && okId(m.id); }).map(function (m) {
-    return {
+    var o = {
       id: okId(m.id), type: m.type === 'video' ? 'video' : 'photo',
       name: String(m.name || '').slice(0, 200), mime: String(m.mime || '').slice(0, 100),
       size: num(m.size), w: num(m.w), h: num(m.h), dur: num(m.dur),
       thumb: okId(m.thumb), preview: okId(m.preview), play: okId(m.play)
     };
+    if (FP_RE.test(String(m.fp || ''))) o.fp = String(m.fp);         // fingerprint, to notice the same photo added twice
+    return o;
   });
   var seen = {};
   var tags = (Array.isArray(x.tags) ? x.tags : []).map(function (t) { return String(t).replace(/^#+/, '').trim().slice(0, 40); })
@@ -467,19 +470,44 @@ function claudeCall(key, path, body) {
     body: body ? JSON.stringify(body) : undefined
   }).then(function (r) {
     return r.json().catch(function () { return {}; }).then(function (d) {
-      if (!r.ok) throw new Error('Claude error ' + r.status + (d.error && d.error.message ? ': ' + d.error.message : ''));
+      var msg = d.error && d.error.message || '';
+      if (!r.ok && r.status === 400 && /credit balance/i.test(msg)) {
+        var e = new Error('Your Claude credit has run out. Top it up on the Claude Console billing page.'); e.credit = true;
+        var was = lsGet('diari-claude-credit');
+        e.told = !!(was && Date.now() - was.at < 12 * 3600e3);          // say so at most twice a day
+        lsSet('diari-claude-credit', { low: true, at: e.told ? was.at : Date.now() });
+        throw e;
+      }
+      if (!r.ok) throw new Error('Claude error ' + r.status + (msg ? ': ' + msg : ''));
+      if (path === 'messages') lsDel('diari-claude-credit');
       return d;
     });
   }, function () { throw new Error('Could not reach Claude. Check your connection.'); });
 }
 
+/* What Diari has spent on Claude this month, on this device (Claude does not let apps read the balance). */
+var PRICES = { 'claude-haiku-5-5': [0.10, 0.50] };          // US$ per million tokens: input, output
+function thisMonth() { var d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2); }
+function noteUse(model, u) {
+  if (!u) return;
+  var x = lsGet('diari-claude-use') || {};
+  if (x.month !== thisMonth()) x = { month: thisMonth(), n: 0, usd: 0, unpriced: false };
+  var p = PRICES[model];
+  x.n++;
+  if (p) x.usd += ((u.input_tokens || 0) * p[0] + (u.output_tokens || 0) * p[1]) / 1e6; else x.unpriced = true;
+  lsSet('diari-claude-use', x);
+}
+function claudeUse() { var x = lsGet('diari-claude-use'); return x && x.month === thisMonth() ? x : { n: 0, usd: 0 }; }
+
 function aiTitle(key, model, rec) {
   var entry = (rec.tags && rec.tags.length ? 'Tags: ' + rec.tags.join(', ') + '\n' : '') + '<entry>\n' + plainText(rec.body).slice(0, 6000) + '\n</entry>';
+  model = model || 'claude-haiku-5-5';
   return claudeCall(key, 'messages', {
-    model: model || 'claude-haiku-5-5', max_tokens: 60,
+    model: model, max_tokens: 60,
     thinking: { type: 'disabled' },          // without this, short entries can use the whole reply on thinking
     system: TITLE_RULES, messages: [{ role: 'user', content: entry }]
   }).then(function (d) {
+    noteUse(model, d.usage);
     if (d.stop_reason === 'max_tokens') throw quiet('Claude replied with more than a title');
     return tidyTitle((d.content || []).filter(function (b) { return b.type === 'text'; }).map(function (b) { return b.text || ''; }).join(''));
   });
@@ -490,6 +518,7 @@ function makeTitle(rec) {
     var key = s.data.anthropicKey;
     if (!key || !String(rec.body || '').trim()) return { title: basicTitle(rec), ai: false, note: '' };
     return aiTitle(key, s.data.claudeModel, rec).then(function (t) { return { title: t, ai: true, note: '' }; }, function (e) {
+      if (e.credit) return { title: basicTitle(rec), ai: false, note: e.told ? '' : 'Your Claude credit has run out, so the first sentence became the title. Top up from Settings.' };
       return { title: basicTitle(rec), ai: false, note: e.quiet ? '' : 'The AI title did not work (' + String(e.message || e).slice(0, 160) + '), so the first sentence was used.' };
     });
   });
@@ -1012,6 +1041,20 @@ window.DiariStore = {
   },
 
   /** Saves (or removes, with '') the Claude key after checking it with Claude. */
+  /** This month's Claude use on this device: { n: titles, usd, unpriced }. */
+  claudeUse: claudeUse,
+  /** True when Claude last said the credit has run out. */
+  creditLow: function () { var x = lsGet('diari-claude-credit'); return !!(x && x.low); },
+  /** After a top-up: a one-word request to see whether Claude works again (costs a tiny fraction of a cent). */
+  checkCredit: function () {
+    return settings().then(function (s) {
+      var key = s.data.anthropicKey;
+      if (!key) return false;
+      return claudeCall(key, 'messages', { model: s.data.claudeModel || 'claude-haiku-5-5', max_tokens: 1, thinking: { type: 'disabled' }, messages: [{ role: 'user', content: 'Hi' }] })
+        .then(function () { return true; }, function (e) { if (e.credit) return false; throw e; });
+    });
+  },
+
   setClaudeKey: function (key) {
     key = String(key || '').trim();
     var check = key ? claudeCall(key, 'models?limit=1') : Promise.resolve();
