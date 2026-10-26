@@ -251,7 +251,8 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
 .tile .rm svg{width:15px;height:15px}
 .tile .bar{position:absolute;left:8px;right:8px;bottom:8px;height:5px;border-radius:3px;background:rgba(255,255,255,.4);overflow:hidden;z-index:2}
 .tile .bar i{display:block;height:100%;background:#fff;width:0;transition:width .2s}
-.tile.uploading::after,.tile.prep::after{content:"";position:absolute;inset:0;background:rgba(0,0,0,.28)}
+.tile.uploading::after,.tile.prep::after,.tile.queued::after,.tile.wait::after{content:"";position:absolute;inset:0;background:rgba(0,0,0,.28)}
+.tile .tnote{position:absolute;left:4px;right:4px;top:50%;transform:translateY(-50%);text-align:center;color:#fff;font-size:12px;font-weight:700;z-index:2;text-shadow:0 1px 3px rgba(0,0,0,.6)}
 .tile.error{outline:2px solid var(--danger);outline-offset:-2px}
 .tile .retry{position:absolute;inset:0;border:0;background:rgba(0,0,0,.55);color:#fff;font-weight:700;font-size:12px;cursor:pointer;z-index:2;padding:6px}
 .add-tile{flex:none;width:96px;height:96px;border-radius:12px;border:1.5px dashed var(--faint);background:transparent;color:var(--muted);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;font-size:12px;font-weight:700;cursor:pointer;line-height:1.2;text-align:center;padding:4px}

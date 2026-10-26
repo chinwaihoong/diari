@@ -498,16 +498,106 @@ function makeTitle(rec) {
 /* ================================================================ */
 /* Photos and videos                                                */
 /* ================================================================ */
-function xhrPut(url, body, range, onProg) {
+/* A phone can lose its connection without saying so (switching Wi-Fi, a weak signal, the screen
+   going off). Every upload request gives up when nothing has moved for a while, and is then retried:
+   a large file carries on from what Google Drive already has. */
+function scale() { return window.DIARI_TIME || 1; }                         // tests run the clock faster
+function stallMs() { return 45e3 * scale(); }
+function chunkSize() { return window.DIARI_CHUNK || 8 * 1024 * 1024; }      // a multiple of 256 KB
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function whenOnline() {
+  if (navigator.onLine !== false) return Promise.resolve();
+  return new Promise(function (r) { window.addEventListener('online', function f() { window.removeEventListener('online', f); r(); }); });
+}
+function netErr(msg, stalled) { var e = new Error(msg || 'The upload lost its connection.'); e.net = true; e.stalled = !!stalled; return e; }
+/** Rejects (as a lost connection) if p takes longer than ms. */
+function limitTime(p, ms, msg) {
   return new Promise(function (res, rej) {
-    var x = new XMLHttpRequest();
-    x.open('PUT', url);
-    x.setRequestHeader('Content-Range', range);
-    x.upload.onprogress = function (e) { if (onProg) onProg(e.loaded); };
-    x.onload = function () { res({ status: x.status, body: x.responseText }); };
-    x.onerror = function () { rej(new Error('The upload lost its connection. Tap the item to try again.')); };
-    x.send(body);
+    var t = setTimeout(function () { rej(netErr(msg || 'Google Drive is not answering.', true)); }, ms);
+    p.then(function (v) { clearTimeout(t); res(v); }, function (e) { clearTimeout(t); rej(e); });
   });
+}
+/** Waits before another try: 1.5 s, 3 s, 6 s … up to 30 s, and until the phone is back online. */
+function backoff(n) { return sleep(scale() * Math.min(30e3, 1500 * Math.pow(2, Math.max(0, n - 1)))).then(whenOnline); }
+
+function xhrSend(method, url, headers, body, onProg) {
+  return new Promise(function (res, rej) {
+    var x = new XMLHttpRequest(), last = Date.now(), over = false;
+    function stop() { over = true; clearInterval(tick); }
+    var tick = setInterval(function () {
+      if (over || Date.now() - last < stallMs()) return;
+      stop(); try { x.abort(); } catch (e) {}
+      rej(netErr('The upload stopped moving.', true));
+    }, Math.min(5000, Math.max(250, stallMs() / 4)));
+    x.open(method, url);
+    Object.keys(headers || {}).forEach(function (k) { x.setRequestHeader(k, headers[k]); });
+    x.upload.onprogress = function (e) { last = Date.now(); if (onProg) onProg(e.loaded, e.total); };
+    x.onprogress = x.onreadystatechange = function () { last = Date.now(); };
+    x.onload = function () {
+      if (over) return; stop();
+      var range = null; try { range = x.getResponseHeader('Range'); } catch (e) {}
+      res({ status: x.status, body: x.responseText, range: range });
+    };
+    x.onerror = x.onabort = function () { if (over) return; stop(); rej(netErr()); };
+    x.send(body == null ? null : body);
+  });
+}
+
+/** Sends a file to a resumable upload. After a dropped connection it asks Drive how much arrived and
+    carries on from there. No Google sign-in is needed for this part, so it keeps going after the
+    sign-in runs out. Resolves with the new file's id. */
+function sendResumable(loc, blob, onProg) {
+  var size = blob.size, off = 0, fails = 0, seenRange = false;
+  function prog(sent) { if (onProg && size) onProg(Math.min(1, (off + sent) / size)); }
+  function acked(r, fallback) {                    // where to carry on, from Drive's "Range: bytes=0-N"
+    var m = r && /bytes=\d+-(\d+)/.exec(r);
+    if (m) { seenRange = true; return +m[1] + 1; }
+    return r === null && !seenRange ? fallback : 0;
+  }
+  function finished(res) { try { return JSON.parse(res.body).id; } catch (e) { throw new Error('Google Drive sent an unexpected reply. Try again.'); } }
+  function answer(res, fallback) {
+    if (res.status === 200 || res.status === 201) return finished(res);
+    if (res.status === 308) { var was = off; off = acked(res.range, fallback); if (off > was) fails = 0; return chunk(); }
+    if (res.status === 404 || res.status === 410) { var e = new Error('The upload had to start again.'); e.restart = true; throw e; }
+    if (res.status >= 500 || res.status === 429 || res.status === 408) return retry(netErr('Google Drive is busy (error ' + res.status + ').'));
+    throw new Error('The upload stopped (Drive error ' + res.status + '). Tap the item to try again.');
+  }
+  function chunk() {
+    var end = Math.min(off + chunkSize(), size);
+    return xhrSend('PUT', loc, { 'Content-Range': 'bytes ' + off + '-' + (end - 1) + '/' + size }, blob.slice(off, end), prog)
+      .then(function (res) { return answer(res, end); }, retry);
+  }
+  function retry(err) {
+    if (!err || !err.net) throw err;
+    if (++fails > 8) throw netErr('The connection kept dropping, so the upload stopped. Tap the item to try again.');   // tried again later as a whole
+    return backoff(fails).then(function () { return xhrSend('PUT', loc, { 'Content-Range': 'bytes */' + size }, null); })
+      .then(function (res) { return answer(res, off); }, retry);
+  }
+  return size ? chunk() : xhrSend('PUT', loc, { 'Content-Range': 'bytes */0' }, null).then(finished);
+}
+
+/** Starts a resumable upload (needs the Google sign-in). size may be left out. */
+function startUpload(meta, mime, size) {
+  var h = { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': mime };
+  if (size != null) h['X-Upload-Content-Length'] = String(size);
+  var tries = 0;
+  function go() {
+    return limitTime(driveFetch(UPLOAD + '/files?uploadType=resumable&fields=id', {
+      method: 'POST', headers: h,
+      body: JSON.stringify({ name: meta.name, parents: [meta.folderId], description: MEDIA_TAG, mimeType: mime })
+    }), 30e3).then(function (r) {
+      if (r.status >= 500 || r.status === 429) throw netErr('Google Drive is busy (error ' + r.status + ').');
+      if (!r.ok) return driveError(r).then(function (m) { throw new Error(m); });
+      var loc = r.headers.get('Location');
+      if (!loc) throw new Error('Google Drive did not start the upload. Try again.');
+      return loc;
+    }).catch(function (e) {
+      if (e instanceof TypeError) e = netErr();                 // fetch: no connection
+      if (e.net && ++tries <= 3) return backoff(tries).then(go);
+      throw e;
+    });
+  }
+  return go();
 }
 
 // Small cache for list previews, so thumbnails appear instantly and offline.
@@ -548,25 +638,28 @@ function uploadSmall(blob, meta, mime, onProg) {
   var head = '--' + b + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
     JSON.stringify({ name: meta.name, parents: [meta.folderId], description: MEDIA_TAG, mimeType: mime }) +
     '\r\n--' + b + '\r\nContent-Type: ' + mime + '\r\n\r\n';
-  var body = new Blob([head, blob, '\r\n--' + b + '--']);
-  return new Promise(function (res, rej) {
-    var x = new XMLHttpRequest();
-    x.open('POST', UPLOAD + '/files?uploadType=multipart&fields=id');
-    x.setRequestHeader('Authorization', 'Bearer ' + Auth.token);
-    x.setRequestHeader('Content-Type', 'multipart/related; boundary=' + b);
-    x.upload.onprogress = function (e) { if (onProg && e.total) onProg(Math.min(1, e.loaded / e.total)); };
-    x.onload = function () {
-      if (x.status === 401) { Auth.token = ''; lsDel('diari-auth'); rej(Expired()); return; }
-      if (x.status >= 200 && x.status < 300) {
-        try { res(JSON.parse(x.responseText).id); } catch (e) { rej(new Error('Google Drive sent an unexpected reply. Try again.')); }
-        return;
-      }
-      var msg = ''; try { msg = JSON.parse(x.responseText).error.message; } catch (e) {}
-      rej(new Error('Google Drive said: ' + (msg || 'error ' + x.status)));
-    };
-    x.onerror = function () { rej(new Error('The upload lost its connection. Tap the item to try again.')); };
-    x.send(body);
-  });
+  var body = new Blob([head, blob, '\r\n--' + b + '--']), tries = 0;
+  function go() {
+    if (!Auth.valid(15e3)) return Promise.reject(Expired());
+    return xhrSend('POST', UPLOAD + '/files?uploadType=multipart&fields=id',
+      { Authorization: 'Bearer ' + Auth.token, 'Content-Type': 'multipart/related; boundary=' + b }, body,
+      function (sent, total) { if (onProg && total) onProg(Math.min(1, sent / total)); })
+      .then(function (x) {
+        if (x.status === 401) { Auth.token = ''; lsDel('diari-auth'); throw Expired(); }
+        if (x.status >= 200 && x.status < 300) {
+          try { return JSON.parse(x.body).id; } catch (e) { throw new Error('Google Drive sent an unexpected reply. Try again.'); }
+        }
+        if (x.status >= 500 || x.status === 429) throw netErr('Google Drive is busy (error ' + x.status + ').');
+        var msg = ''; try { msg = JSON.parse(x.body).error.message; } catch (e) {}
+        throw new Error('Google Drive said: ' + (msg || 'error ' + x.status));
+      })
+      .catch(function (e) {
+        if (e.net && ++tries <= 4) return backoff(tries).then(go);
+        if (e.net) throw new Error('The connection kept dropping, so the upload stopped. Tap the item to try again.');
+        throw e;
+      });
+  }
+  return go();
 }
 
 /* ================================================================ */
@@ -857,38 +950,27 @@ window.DiariStore = {
   target: function (date) {
     var k = date.slice(0, 7);
     if (targets[k]) return targets[k];
-    targets[k] = root().then(function (r) { return folder(r, MEDIA_NAME); }).then(function (media) {
+    var found = root().then(function (r) { return folder(r, MEDIA_NAME); }).then(function (media) {
       return Promise.all([folder(media, date.slice(0, 4)).then(function (y) { return folder(y, date.slice(5, 7)); }), folder(media, PREVIEWS_NAME)]);
-    }).then(function (x) { return { folderId: x[0], previewId: x[1] }; })
-      .catch(function (e) { delete targets[k]; throw e; });
+    }).then(function (x) { return { folderId: x[0], previewId: x[1] }; });
+    targets[k] = limitTime(found, 60e3).catch(function (e) {
+      delete targets[k];
+      if (e instanceof TypeError) e = netErr();
+      throw e;
+    });
     return targets[k];
   },
 
   upload: function (blob, meta, onProg) {
     var size = blob.size, mime = meta.mime || blob.type || 'application/octet-stream';
     if (size <= 5 * 1024 * 1024) return uploadSmall(blob, meta, mime, onProg);
-    return driveFetch(UPLOAD + '/files?uploadType=resumable&fields=id', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': mime, 'X-Upload-Content-Length': String(size) },
-      body: JSON.stringify({ name: meta.name, parents: [meta.folderId], description: MEDIA_TAG, mimeType: mime })
-    }).then(function (r) {
-      if (!r.ok) return driveError(r).then(function (m) { throw new Error(m); });
-      var loc = r.headers.get('Location');
-      if (!loc) throw new Error('Google Drive did not start the upload. Try again.');
-      var CH = 8 * 1024 * 1024, off = 0;
-      function next() {
-        var end = Math.min(off + CH, size);
-        var range = size ? 'bytes ' + off + '-' + (end - 1) + '/' + size : 'bytes */0';
-        return xhrPut(loc, blob.slice(off, end), range, function (sent) { if (onProg && size) onProg(Math.min(1, (off + sent) / size)); })
-          .then(function (res) {
-            if (res.status === 200 || res.status === 201) return JSON.parse(res.body).id;
-            if (res.status === 308 && end < size) { off = end; return next(); }
-            throw new Error('The upload stopped (Drive error ' + res.status + '). Tap the item to try again.');
-          });
-      }
-      return next();
-    });
+    return startUpload(meta, mime, size).then(function (loc) { return sendResumable(loc, blob, onProg); });
   },
+
+  /** Starts an upload now, while the Google sign-in is fresh; send() can finish it any time within a week. */
+  startUpload: function (meta, size) { return startUpload(meta, meta.mime || 'application/octet-stream', size); },
+  send: function (loc, blob, onProg) { return sendResumable(loc, blob, onProg); },
+  whenOnline: whenOnline,
 
   /** The first bytes of a file (where a photo keeps its EXIF details: date, camera, location). */
   readStart: function (id, bytes) {

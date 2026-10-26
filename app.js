@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v21';
+var APP_VERSION = 'v22';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -171,7 +171,8 @@ var Outbox = {
     clearTimeout(this.timer);
     if (this.busy || !this.items.length) return;
     if (!navigator.onLine) { this.waiting = true; refreshPending(); return; }
-    if (!Auth.valid(30e3)) { this.waiting = true; refreshPending(); if (!ED) reauth(); return; }
+    // Signing in again leaves the page, so never while photos are still going up (UpQ calls this again when they are done).
+    if (!Auth.valid(30e3)) { this.waiting = true; refreshPending(); if (!ED && !UpQ.busy()) reauth(); return; }
     this.busy = true; this.waiting = false; refreshPending();
     var item = this.items[0];
     API.save(item.rec).then(function (saved) {
@@ -185,7 +186,7 @@ var Outbox = {
       self.run();
     }).catch(function (err) {
       self.busy = false; self.waiting = true; refreshPending();
-      if (err && err.expired) { if (!ED) reauth(); return; }
+      if (err && err.expired) { if (!ED && !UpQ.busy()) reauth(); return; }
       self.tries++;
       if (self.tries === 1 || self.tries % 5 === 0) toast(errText(err) + ' Diari keeps it on this device and tries again.', 6000);
       self.timer = setTimeout(function () { self.run(); }, Math.min(120e3, 15e3 * self.tries));
@@ -224,7 +225,7 @@ function fresh(minutes, resume) {
 var RENEW_AT = 30 * 60e3;   // renew the Google sign-in quietly when the app opens or comes back with less than this left
 document.addEventListener('visibilitychange', function () {
   if (document.hidden || !S.loaded || ED || !navigator.onLine || !Auth.email || Auth.silentFailed || Auth.valid(RENEW_AT)) return;
-  if (Outbox.busy || !Copies.idle() || Uploads.any() || $('.lb')) return;          // never in the middle of something
+  if (Outbox.busy || !Copies.idle() || Uploads.any() || UpQ.busy() || $('.lb')) return;          // never in the middle of something
   reauth();
 });
 
@@ -826,17 +827,19 @@ var Copies = {
     var self = this;
     clearTimeout(this.timer);
     if (this.busy || !this.queue.length) return;
+    // After the uploads, so they get the phone's full attention (UpQ starts this again when they are done).
+    if (UpQ.busy()) return;
     // A copy takes a few minutes; start only with enough sign-in time left (otherwise sign in again first).
     if (!Auth.valid(10 * 60e3)) {
       if (this.queue.some(function (j) { return j.fromFix; })) lsSet('diari-copyresume', { at: Date.now() });   // carry on after signing in
-      if (!ED && navigator.onLine) reauth();
+      if (!ED && navigator.onLine && !Uploads.any()) reauth();
       this.timer = setTimeout(function () { self.run(); }, 30e3); return;
     }
     var job = this.queue.shift();
-    this.busy = true; this.current = job; this.prog = 0;
+    this.busy = true; this.current = job; this.prog = 0; Awake.check();
     var again = false;
     var finish = function () {
-      self.busy = false; self.current = null;
+      self.busy = false; self.current = null; Awake.check();
       if (!again && !--self.active[job.entryId]) delete self.active[job.entryId];
       refreshPending();
       if (!again && job.done) job.done(job);
@@ -857,7 +860,7 @@ var Copies = {
     }).then(function (playId) { attachPlay(job, playId); job.ok = true; }, function (err) {
       job.err = errText(err);
       try { console.warn('Diari video copy:', job.err, err); } catch (e) {}
-      if (err && err.expired) { again = true; self.queue.unshift(job); if (job.fromFix) lsSet('diari-copyresume', { at: Date.now() }); if (!ED) reauth(); }
+      if (err && err.expired) { again = true; self.queue.unshift(job); if (job.fromFix) lsSet('diari-copyresume', { at: Date.now() }); if (!ED && !UpQ.busy()) reauth(); }
     }).then(function () {
       if (!again) CopyLog.note(job);
       finish();
@@ -1559,7 +1562,111 @@ $('#sheet-settings').addEventListener('click', function (ev) { if (ev.target.clo
 /* ================================================================ */
 var edSheet = $('#sheet-editor');
 var ED = null;
-var uploadQueue = Promise.resolve();
+
+/* Photos and videos go up three at a time. Their previews are made one at a time (a big photo needs a lot
+   of the phone's memory), and each upload is started in Google Drive as soon as it is added, so a long
+   batch keeps going even after the Google sign-in runs out. */
+var UpQ = {
+  list: [], active: 0, later: 0, MAX: 3,
+  add: function (m) { if (this.list.indexOf(m) < 0) this.list.push(m); this.pump(); Awake.check(); },
+  busy: function () { return this.active > 0 || this.list.length > 0 || this.later > 0; },
+  pump: function () {
+    var self = this;
+    while (this.active < this.MAX && this.list.length) {
+      var m = this.list.shift();
+      this.active++;
+      processUpload(m).catch(function () {}).then(function () {
+        self.active--; self.pump();
+        if (!self.busy()) { Outbox.run(); Copies.run(); Awake.check(); }
+      });
+    }
+  },
+  /** The connection dropped: try this one again in a while. */
+  retryLater: function (m, ms) {
+    var self = this; this.later++;
+    setTimeout(function () { API.whenOnline().then(function () { self.later--; self.add(m); }); }, ms);
+  }
+};
+window.addEventListener('offline', function () { if (UpQ.busy()) toast('No connection. Uploads carry on when you are back online.', 5000); });
+
+/* Keeps the screen on while photos and videos upload or a video copy is made: with the screen off,
+   the phone pauses Diari and nothing moves. */
+var Awake = {
+  lock: null, asking: false,
+  want: function () { return UpQ.busy() || Copies.busy; },
+  check: function () {
+    var self = this;
+    if (!this.want()) { if (this.lock) { var l = this.lock; this.lock = null; l.release().catch(function () {}); } return; }
+    if (this.lock || this.asking || document.hidden || !navigator.wakeLock) return;
+    this.asking = true;
+    navigator.wakeLock.request('screen').then(function (l) {
+      self.asking = false; self.lock = l;
+      l.addEventListener('release', function () { if (self.lock === l) self.lock = null; });
+      if (!self.want()) self.check();
+    }, function () { self.asking = false; });
+  }
+};
+document.addEventListener('visibilitychange', function () { if (!document.hidden) Awake.check(); });
+
+/** At most four uploads are started in Google Drive at the same time. */
+var Gate = {
+  n: 0, q: [], MAX: 4,
+  run: function (fn) {
+    var self = this;
+    return new Promise(function (res, rej) {
+      self.q.push(function () { self.n++; Promise.resolve().then(fn).then(res, rej).then(function () { self.n--; self.next(); }); });
+      self.next();
+    });
+  },
+  next: function () { while (this.n < this.MAX && this.q.length) this.q.shift()(); }
+};
+
+/** Starts the uploads for one photo or video (the original and its two previews). */
+function startSessions(m) {
+  var p = Gate.run(function () {
+    if (gone(m)) return Promise.reject(new Error('removed'));
+    var date = edDate(m.ed), name = date.slice(0, 10) + ' ' + m.name;
+    return API.target(date).then(function (tgt) {
+      return Promise.all([
+        API.startUpload({ name: name, folderId: tgt.folderId, mime: m.mime || (m.file && m.file.type) || '' }, m.size),
+        API.startUpload({ name: name + '.thumb.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }),
+        API.startUpload({ name: name + '.preview.jpg', folderId: tgt.previewId, mime: 'image/jpeg' })
+      ]);
+    }).then(function (l) { return { orig: l[0], thumb: l[1], preview: l[2] }; });
+  });
+  p.catch(function () { if (m.sess === p) m.sess = null; });       // the next try starts again
+  return p;
+}
+
+/** Resolves with p, or with fallback if p takes longer than ms. */
+function within(p, ms, fallback) {
+  return new Promise(function (res) {
+    var t = setTimeout(function () { res(fallback); }, ms);
+    p.then(function (v) { clearTimeout(t); res(v); }, function () { clearTimeout(t); res(fallback); });
+  });
+}
+
+var prepLock = Promise.resolve();
+/** Size and previews, made once per photo or video and one at a time. */
+function prepOnce(m) {
+  if (m.info) return Promise.resolve(m.info);
+  var p = prepLock.then(function () {
+    if (m.info) return m.info;
+    if (gone(m)) return {};
+    // A photo that cannot be read in time is saved without previews (the original is shown instead).
+    return within(m.type === 'video' ? videoInfo(m.file) : photoInfo(m.file), 45e3, {});
+  }).then(function (v) { m.info = v; return v; });
+  prepLock = p.catch(function () {});
+  return p;
+}
+
+/** Removed from the entry, or the entry was closed without saving. */
+function gone(m) { var ed = m.ed; return !ed || m.cancelled || ed.media.indexOf(m) < 0 || (ED !== ed && !ed.saved); }
+function discardGot(m) {
+  var g = m.got || {};
+  if (g.id || g.thumb || g.preview) API.discard([{ id: g.id || '', thumb: g.thumb || '', preview: g.preview || '' }]).catch(function () {});
+  m.got = {};
+}
 
 function edSnapshot() {
   return JSON.stringify({ d: $('#ed-date').value, t: $('#ed-title').value, b: $('#ed-body').value, g: ED.tags, m: ED.media.map(function (m) { return m.key; }) });
@@ -1800,8 +1907,10 @@ document.addEventListener('visibilitychange', function () {
 });
 
 function tileHTML(m) {
-  var img = m.localThumb ? '<img alt="" src="' + esc(m.localThumb) + '">' : (m.thumb ? '<img alt="" class="mimg" data-mid="' + esc(m.thumb) + '">' : '<span class="ph-icon">' + I.image + '</span>');
-  var bar = (m.status === 'uploading' || m.status === 'prep') ? '<span class="bar"><i style="width:' + Math.round((m.prog || 0) * 100) + '%"></i></span>' : '';
+  var img = m.localThumb ? '<img alt="" loading="lazy" decoding="async" src="' + esc(m.localThumb) + '">' : (m.thumb ? '<img alt="" class="mimg" data-mid="' + esc(m.thumb) + '">' : '<span class="ph-icon">' + I.image + '</span>');
+  var bar = /^(queued|prep|uploading|wait)$/.test(m.status) ? '<span class="bar"><i style="width:' + Math.round((m.prog || 0) * 100) + '%"></i></span>' : '';
+  var note = m.status === 'queued' ? '<span class="tnote">Waiting</span>' : m.status === 'wait' ? '<span class="tnote">Retrying…</span>' : '';
+  if (note) bar += note;
   var err = m.status === 'error' ? '<button class="retry" data-retry="' + m.key + '">Upload failed. Tap to retry</button>' : '';
   var badge = m.type === 'video' && m.status === 'done' ? '<span class="badge">' + I.play + fmtDur(m.dur) + '</span>' : '';
   return '<div class="tile ' + (m.status || 'done') + '" data-key="' + m.key + '">' + img + bar + badge + err +
@@ -1847,11 +1956,12 @@ function kindOf(f) {
 
 function addFiles(files) {
   Array.prototype.forEach.call(files, function (f) {
-    var m = { key: rid(8), type: kindOf(f), name: f.name || (kindOf(f) === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, status: 'prep', prog: 0, file: f, isNew: true, ed: ED };
+    var m = { key: rid(8), type: kindOf(f), name: f.name || (kindOf(f) === 'video' ? 'video.mp4' : 'photo.jpg'), mime: f.type || '', size: f.size, status: 'queued', prog: 0, file: f, isNew: true, ed: ED };
     if (m.type === 'photo') m.localThumb = URL.createObjectURL(f);
     if (m.type === 'video' && f.size > 500e6) toast('Large video (' + fmtSize(f.size) + '). Uploading will take a while.', 4500);
     ED.media.push(m);
-    uploadQueue = uploadQueue.then(function () { return processUpload(m); });
+    m.sess = startSessions(m);          // now, while the Google sign-in is fresh
+    UpQ.add(m);
   });
   renderTray(); updateSave();
   var tray = $('#ed-tray'); tray.scrollLeft = tray.scrollWidth;
@@ -1862,35 +1972,36 @@ function edDate(ed) { return ed.savedDate || (ED === ed && $('#ed-date').value) 
 
 function processUpload(m) {
   var ed = m.ed;
-  if (!ed || m.cancelled || ed.media.indexOf(m) < 0 || (ED !== ed && !ed.saved)) return Promise.resolve();
-  m.status = 'prep'; m.prog = Math.max(m.prog || 0, 0.02); renderTile(m); updateSave();
-  var info;
-  return (m.type === 'video' ? videoInfo(m.file) : photoInfo(m.file)).then(function (v) {
-    info = v;
-    m.w = v.w || 0; m.h = v.h || 0; m.dur = v.dur || 0;
-    if (v.thumb) { if (m.localThumb) URL.revokeObjectURL(m.localThumb); m.localThumb = URL.createObjectURL(v.thumb); }
-    if (m.type === 'video' && !v.w) toast('This video may not play in every browser. It will still be saved.', 5000);
-    m.status = 'uploading'; renderTile(m);
-    return API.target(edDate(ed));
-  }).then(function (tgt) {
-    var name = edDate(ed).slice(0, 10) + ' ' + m.name;
-    // The original and its two small previews upload at the same time.
-    var got = {};
-    var up = function (k, blob, meta, prog) {
+  if (gone(m)) return Promise.resolve();
+  if (!m.info) { m.status = 'prep'; m.prog = Math.max(m.prog || 0, 0.02); renderTile(m); updateSave(); }
+  var got = m.got = m.got || {};
+  return prepOnce(m).then(function (v) {
+    if (gone(m)) return null;
+    if (m.status !== 'uploading') {
+      m.w = v.w || 0; m.h = v.h || 0; m.dur = v.dur || 0;
+      if (v.thumb && !m.ownThumb) { if (m.localThumb) URL.revokeObjectURL(m.localThumb); m.localThumb = URL.createObjectURL(v.thumb); m.ownThumb = true; }
+      if (m.type === 'video' && !v.w && !m.warned) { m.warned = true; toast('This video may not play in every browser. It will still be saved.', 5000); }
+      m.status = 'uploading'; renderTile(m); updateSave();
+    }
+    return m.sess || (m.sess = startSessions(m));
+  }).then(function (s) {
+    if (!s || gone(m)) return null;
+    // The original and its two small previews upload at the same time; parts already sent are not sent again.
+    var info = m.info;
+    var up = function (k, blob, loc, prog) {
+      if (got[k]) return Promise.resolve(got[k]);
       if (!blob) return Promise.resolve('');
-      return API.upload(blob, meta, prog).then(function (id) { got[k] = id; return id; });
+      return API.send(loc, blob, prog).then(function (id) { got[k] = id; return id; });
     };
     return Promise.all([
-      up('id', m.file, { name: name, folderId: tgt.folderId, mime: m.mime }, function (f) { setProg(m, 0.04 + f * 0.92); }),
-      up('thumb', info.thumb, { name: name + '.thumb.jpg', folderId: tgt.previewId, mime: 'image/jpeg' }),
-      up('preview', info.preview, { name: name + '.preview.jpg', folderId: tgt.previewId, mime: 'image/jpeg' })
-    ]).then(function (ids) { m.id = ids[0]; m.thumb = ids[1]; m.preview = ids[2]; }, function (err) {
-      if (got.id || got.thumb || got.preview) API.discard([{ id: got.id || '', thumb: got.thumb || '', preview: got.preview || '' }]).catch(function () {});
-      throw err;
-    });
-  }).then(function () {
-    if (m.cancelled || ed.media.indexOf(m) < 0 || (ED !== ed && !ed.saved)) { API.discard([pickIds(m)]).catch(function () {}); return; }
-    m.status = 'done'; m.prog = 1;
+      up('id', m.file, s.orig, function (f) { setProg(m, 0.04 + f * 0.92); }),
+      up('thumb', info.thumb, s.thumb),
+      up('preview', info.preview, s.preview)
+    ]);
+  }).then(function (ids) {
+    if (!ids || gone(m)) { discardGot(m); return; }
+    m.id = ids[0]; m.thumb = ids[1]; m.preview = ids[2];
+    m.status = 'done'; m.prog = 1; m.info = null; m.sess = null;
     var file = m.file;
     delete m.file;
     if (ed.saved && ED !== ed) attachUpload(ed, m);              // saved already: add it to the entry
@@ -1899,6 +2010,15 @@ function processUpload(m) {
       Copies.add({ entryId: ed.id, mediaId: m.id, file: file, name: edDate(ed).slice(0, 10) + ' ' + m.name, date: edDate(ed) });
     }
   }).catch(function (err) {
+    if (gone(m)) { discardGot(m); return; }
+    if (err && err.restart) m.sess = null;                         // Drive forgot the upload: start it again
+    // A dropped connection: try again by itself a few times before asking.
+    if (err && !err.expired && (err.net || err.restart) && (m.tries = (m.tries || 0) + 1) <= 3) {
+      m.status = 'wait'; renderTile(m);
+      UpQ.retryLater(m, 8e3 * m.tries * (window.DIARI_TIME || 1));
+      return;
+    }
+    discardGot(m); m.sess = null;
     if (ed.saved && ED !== ed) {
       m.status = 'error';
       Uploads.done(ed.id, m);
@@ -1969,7 +2089,7 @@ function attachUpload(ed, m) {
 function saveEditor() {
   if (!ED) return;
   var b = $('#ed-save');
-  var going = ED.media.filter(function (m) { return m.status === 'prep' || m.status === 'uploading'; });
+  var going = ED.media.filter(function (m) { return /^(queued|prep|uploading|wait)$/.test(m.status); });
   var failed = ED.media.filter(function (m) { return m.status === 'error'; }).length;
   if (failed) { toast(plural(failed, 'upload') + ' failed. Tap it to retry, or remove it.', 4500); return; }
   var typed = $('#ed-title').value.trim(), titleAuto = false, keepShown = '';
@@ -2028,7 +2148,7 @@ edSheet.addEventListener('click', function (ev) {
   var t = ev.target;
   var act = t.closest('[data-act]');
   if (act) { var a = act.getAttribute('data-act'); if (a === 'cancel') Nav.pop(); else if (a === 'save') saveEditor(); return; }
-  if (t.closest('[data-add]')) { if (fresh(15)) $('#ed-file').click(); return; }
+  if (t.closest('[data-add]')) { if (fresh(5)) $('#ed-file').click(); return; }
   var rm = t.closest('[data-rm]');
   if (rm) {
     var key = rm.getAttribute('data-rm'), m = ED.media.find(function (x) { return x.key === key; });
@@ -2041,7 +2161,7 @@ edSheet.addEventListener('click', function (ev) {
   var rt = t.closest('[data-retry]');
   if (rt) {
     var mk = ED.media.find(function (x) { return x.key === rt.getAttribute('data-retry'); });
-    if (mk && mk.file) { mk.ed = ED; mk.status = 'prep'; mk.prog = 0; renderTile(mk); updateSave(); uploadQueue = uploadQueue.then(function () { return processUpload(mk); }); }
+    if (mk && mk.file) { mk.ed = ED; mk.status = 'queued'; mk.prog = 0; mk.tries = 0; renderTile(mk); updateSave(); if (!mk.sess) mk.sess = startSessions(mk); UpQ.add(mk); }
     return;
   }
   var ut = t.closest('[data-untag]');
