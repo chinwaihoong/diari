@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v24';
+var APP_VERSION = 'v25';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -677,19 +677,16 @@ function openSheet(sh, onClose) {
 /* ---------- entry view ---------- */
 var entrySheet = $('#sheet-entry');
 
+/** Every photo and video, however many: the first one large, the rest in full rows of two or three. */
 function galleryHTML(e) {
   var ms = e.media, n = ms.length;
   if (!n) return '';
-  var shown = ms.slice(0, 7), extra = n - shown.length, cls = [];
+  var shown = ms, cls = [];
   if (n === 2) cls = ms.some(function (m) { return m.type === 'video'; }) ? ['hero', 'hero'] : ['half', 'half'];
   else {
     cls.push('hero');
-    var r = shown.length - 1;
-    for (var i = 0; i < r; i++) {
-      if (r % 3 === 0) cls.push('third');
-      else if (r % 2 === 0) cls.push('half');
-      else cls.push(i < 2 ? 'half' : 'third');
-    }
+    var r = n - 1, halves = r % 3 === 0 ? 0 : r % 3 === 2 ? 2 : 4;   // so that every row is full
+    for (var i = 0; i < r; i++) cls.push(i < halves ? 'half' : 'third');
   }
   return '<div class="gal">' + shown.map(function (m, i) {
     var c = cls[i], ar = '';
@@ -701,8 +698,7 @@ function galleryHTML(e) {
     var label = (m.type === 'video' ? 'Play video' : 'Open photo') + (m.dur ? ', ' + fmtDur(m.dur) : '');
     return '<div class="gi ' + c + '" role="button" tabindex="0" data-gi="' + i + '" aria-label="' + label + '"' + ar + '>' +
       thumbTag(m, big) +
-      (m.type === 'video' ? '<span class="play">' + I.play + '</span><span class="badge">' + fmtDur(m.dur) + '</span>' : '') +
-      (extra > 0 && i === shown.length - 1 ? '<span class="more">+' + extra + '</span>' : '') + '</div>';
+      (m.type === 'video' ? '<span class="play">' + I.play + '</span><span class="badge">' + fmtDur(m.dur) + '</span>' : '') + '</div>';
   }).join('') + '</div>';
 }
 
