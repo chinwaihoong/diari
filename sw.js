@@ -3,7 +3,7 @@
    - Streams videos from Google Drive: the video player asks for stream/<file id>, and this adds the
      Google sign-in and passes the video through piece by piece, so playback starts at once.
    Your journal data is never stored here; it comes from Google Drive. */
-var CACHE = 'diari-v28';
+var CACHE = 'diari-v29';
 var SHELL = ['./', 'index.html', 'app.js', 'store.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-192.png', 'icons/maskable-512.png', 'icons/icon-180.png'];
 var DRIVE = 'https://www.googleapis.com/drive/v3/files/';
@@ -20,27 +20,25 @@ self.addEventListener('activate', function (e) {
 
 /* ---------- Google sign-in for streaming (kept in memory only) ---------- */
 var TOKEN = '', TOKEN_EXP = 0;
-self.addEventListener('message', function (e) {
-  var d = e.data || {};
-  if (d.type === 'token') { TOKEN = d.token || ''; TOKEN_EXP = d.exp || 0; }
-});
+function keep(d) { if (d && d.token && (d.exp || 0) > TOKEN_EXP) { TOKEN = d.token; TOKEN_EXP = d.exp || 0; } }   // the newest sign-in wins
+self.addEventListener('message', function (e) { var d = e.data || {}; if (d.type === 'token') keep(d); });
 
-// This helper can be stopped and restarted by the phone at any time, so ask an open Diari window if needed.
-function token() {
-  if (TOKEN && TOKEN_EXP - Date.now() > 30e3) return Promise.resolve(TOKEN);
-  return self.clients.matchAll({ type: 'window' }).then(function (wins) {
-    if (!wins.length) return '';
-    return new Promise(function (res) {
-      var ch = new MessageChannel(), done = false;
-      ch.port1.onmessage = function (ev) {
-        done = true;
-        var d = ev.data || {};
-        if (d.token) { TOKEN = d.token; TOKEN_EXP = d.exp || 0; }
-        res(d.token || '');
-      };
-      wins[0].postMessage({ type: 'need-token' }, [ch.port2]);
-      setTimeout(function () { if (!done) res(''); }, 3000);
-    });
+// This helper can be stopped and restarted by the phone at any time, and an old Diari tab may still be open
+// with a sign-in that has run out: ask every open Diari window and use the newest sign-in.
+function token(force) {
+  if (!force && TOKEN && TOKEN_EXP - Date.now() > 30e3) return Promise.resolve(TOKEN);
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (wins) {
+    return Promise.all(wins.map(function (w) {
+      return new Promise(function (res) {
+        var ch = new MessageChannel(), done = false;
+        ch.port1.onmessage = function (ev) { done = true; res(ev.data || {}); };
+        try { w.postMessage({ type: 'need-token' }, [ch.port2]); } catch (e) { res({}); }
+        setTimeout(function () { if (!done) res({}); }, 2500);
+      });
+    }));
+  }).then(function (answers) {
+    answers.forEach(keep);
+    return TOKEN && TOKEN_EXP - Date.now() > 30e3 ? TOKEN : '';
   });
 }
 
@@ -52,14 +50,16 @@ function sizeOf(id, t) {
     .then(function (j) { sizes[id] = Number(j.size) || 0; return sizes[id]; }, function () { return 0; });
 }
 
-function stream(req, id, knownSize) {
+function stream(req, id, knownSize, again) {
   if (knownSize) sizes[id] = knownSize;
-  return token().then(function (t) {
+  return token(again).then(function (t) {
     if (!t) return new Response('Diari is not signed in.', { status: 401 });
     var headers = { Authorization: 'Bearer ' + t };
     var range = req.headers.get('Range');
     if (range) headers.Range = range;
     return fetch(DRIVE + encodeURIComponent(id) + '?alt=media', { headers: headers }).then(function (res) {
+      // A sign-in that ran out: get the newest one from the open Diari windows and try once more.
+      if (res.status === 401 && !again) { TOKEN = ''; TOKEN_EXP = 0; return stream(req, id, knownSize, true); }
       if (res.status !== 200 && res.status !== 206) return res;
       var h = new Headers();
       h.set('Content-Type', res.headers.get('Content-Type') || 'video/mp4');

@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v28';
+var APP_VERSION = 'v29';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -197,7 +197,7 @@ var Outbox = {
   }
 };
 window.addEventListener('online', function () { Outbox.run(); });
-document.addEventListener('visibilitychange', function () { if (!document.hidden) Outbox.run(); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) { Outbox.run(); Stream.sendToken(); } });
 
 /** What an entry waiting to upload looks like on screen (its title is a stand-in until Claude names it). */
 function shownRec(rec) {
@@ -1185,6 +1185,17 @@ function playId(m) { return m.play && !m.noPlay ? m.play : m.id; }
 /* ---------- Videos stream through Diari's offline helper (sw.js), so they start at once ---------- */
 var Stream = {
   ok: function () { return !!(navigator.serviceWorker && navigator.serviceWorker.controller) && Auth.valid(60e3); },
+  /** Streaming needs Diari's helper to be in charge of the page; right after an update it can take a moment. */
+  ready: function () {
+    if (Stream.ok()) { Stream.sendToken(); return Promise.resolve(true); }
+    if (!navigator.serviceWorker || !Auth.valid(60e3)) return Promise.resolve(false);
+    return new Promise(function (res) {
+      var done = function (v) { if (done.d) return; done.d = 1; res(v); };
+      navigator.serviceWorker.addEventListener('controllerchange', function () { Stream.sendToken(); done(Stream.ok()); }, { once: true });
+      navigator.serviceWorker.ready.then(function () { if (Stream.ok()) { Stream.sendToken(); done(true); } });
+      setTimeout(function () { done(Stream.ok()); }, 3000);
+    });
+  },
   url: function (m) { var id = playId(m); return 'stream/' + encodeURIComponent(id) + (id === m.id && m.size ? '?s=' + Math.round(m.size) : ''); },
   sendToken: function () {
     var c = navigator.serviceWorker && navigator.serviceWorker.controller;
@@ -1194,6 +1205,9 @@ var Stream = {
 if (navigator.serviceWorker) {
   navigator.serviceWorker.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'need-token' && e.ports && e.ports[0]) {
+      // Another Diari window may have signed in again since this one did: use the newest sign-in on the device.
+      var saved = lsGet('diari-auth');
+      if (saved && saved.token && saved.exp > Auth.exp) { Auth.token = saved.token; Auth.exp = saved.exp; }
       e.ports[0].postMessage(Auth.valid(30e3) ? { token: Auth.token, exp: Auth.exp } : {});
     }
   });
@@ -1202,21 +1216,39 @@ if (navigator.serviceWorker) {
 
 function spinner() { return el('<span class="vspin" role="status" aria-label="Loading video"></span>'); }
 
-/** A video element that plays from the stream; calls fallback() if streaming does not work. */
+/** A video element that plays from the stream; tries once more, then calls fallback() if streaming does not work. */
 function streamVideo(m, poster, fallback) {
   var v = document.createElement('video');
   v.controls = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
   if (poster) v.poster = poster;
-  var started = false;
-  v.addEventListener('loadeddata', function () { started = true; v.dispatchEvent(new Event('diari-ready')); });
-  v.addEventListener('error', function () { if (!started) fallback(); else videoFailFor(v, m); }, { once: true });
+  var started = false, retried = false;
+  v.addEventListener('loadeddata', function () { if (!started) { started = true; v.dispatchEvent(new Event('diari-ready')); } });
+  v.addEventListener('error', function onErr() {
+    if (started) { v.removeEventListener('error', onErr); videoFailFor(v, m); return; }
+    if (!retried) {                                    // usually a sign-in that ran out: hand over the current one and try again
+      retried = true; Stream.sendToken();
+      setTimeout(function () { v.src = Stream.url(m) + (Stream.url(m).indexOf('?') < 0 ? '?' : '&') + 'r=1'; v.play().catch(function () {}); }, 400);
+      return;
+    }
+    v.removeEventListener('error', onErr); fallback();
+  });
+  Stream.sendToken();
   v.src = Stream.url(m);
   return v;
 }
+var told = {};
+function noStreamNote(m) { if (told[m.id]) return; told[m.id] = 1; toast('This video could not stream, so it is downloading first.', 4500); }
 function videoFailFor(v, m) { var box = v.parentNode; if (box) videoFail(box, m); }
 
 function playInline(tile, m) {
   if (tile.classList.contains('playing') || tile.classList.contains('loading')) return;
+  if (!Stream.ok() && navigator.serviceWorker && Auth.valid(60e3) && !tile.dataset.waited) {
+    // Diari's helper is not in charge yet (just updated): wait a moment for it rather than downloading the whole video.
+    tile.dataset.waited = '1'; tile.classList.add('loading');
+    Stream.ready().then(function () { tile.classList.remove('loading'); playInline(tile, m); });
+    return;
+  }
+  delete tile.dataset.waited;
   if (Stream.ok()) {
     var playBtnS = $('.play', tile); if (playBtnS) playBtnS.hidden = true;
     var posterS = $('img', tile);
@@ -1226,7 +1258,7 @@ function playInline(tile, m) {
       v.remove(); spin.remove(); tile.classList.remove('playing');
       if (playBtnS) playBtnS.hidden = false;
       if (m.play && !m.noPlay) { m.noPlay = true; playInline(tile, m); return; }   // copy didn't play: use the original
-      downloadAndPlay(tile, m);                                                      // streaming didn't work: download it
+      noStreamNote(m); downloadAndPlay(tile, m);                                     // streaming didn't work: download it
     });
     v.addEventListener('diari-ready', function () { spin.remove(); });
     $$('.badge', tile).forEach(function (b) { b.remove(); });
@@ -1359,7 +1391,7 @@ function openLightbox(items, index, fromMedia) {
       var sp = spinner();
       var sv = streamVideo(m, '', function () {
         if (items[i] !== m) return;
-        if (m.play && !m.noPlay) m.noPlay = true; else m.noStream = true;   // try the original, then downloading
+        if (m.play && !m.noPlay) m.noPlay = true; else { m.noStream = true; noStreamNote(m); }   // try the original, then downloading
         show();
       });
       sv.autoplay = true;
@@ -1554,7 +1586,7 @@ function openSettings() {
 
     '<h3>Account</h3><p>' + (Auth.email ? 'Signed in as <b>' + esc(Auth.email) + '</b>' : 'Signed in with Google') + '</p>' +
     '<button class="btn ghost" id="btn-signout">Sign out on this device</button>' +
-    '<h3>Videos</h3><p class="muted">Short clips start almost at once. Long videos download first, so they take a moment. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>' +
+    '<h3>Videos</h3><p class="muted">Videos start playing while they load, so even long ones begin within a few seconds. If a Samsung phone records in “High efficiency video”, some PC browsers cannot play it; turn that off in Camera settings for the best results.</p>' +
     '<details class="trouble" id="trouble"><summary>Troubleshooting</summary>' +
       '<p class="muted">If an entry is missing from the list (for example after saving on two devices at the same moment), rebuild the list from the entry files in Drive.</p>' +
       '<button class="btn soft" id="btn-rebuild">Rebuild from Drive files</button>' +
