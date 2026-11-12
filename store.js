@@ -353,8 +353,7 @@ function saveSettings(patch) {
 var DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 function cleanTrip(t) {
   if (!t || !/^[A-Za-z0-9_-]{6,32}$/.test(String(t.id)) || !DAY_RE.test(String(t.start)) || !DAY_RE.test(String(t.end))) return null;
-  var name = String(t.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-  if (!name) return null;
+  var name = String(t.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);     // optional: without one, the first entry's title is shown
   var a = String(t.start), b = String(t.end);
   if (b < a) { var x = a; a = b; b = x; }
   return { id: String(t.id), name: name, start: a, end: b, summary: String(t.summary || '').slice(0, 3000),
@@ -1109,11 +1108,11 @@ window.DiariStore = {
 
   /** Saves (or removes, with '') the Claude key after checking it with Claude. */
   /** Trips: saveTrip adds or changes one (by id), deleteTrip removes one. Both resolve with the full, current list. */
-  saveTrip: function (t) {
-    var c = cleanTrip(t);
-    if (!c) return Promise.reject(new Error('A trip needs a name, a first day and a last day.'));
+  saveTrip: function (t, removeIds) {
+    var c = cleanTrip(t), gone = removeIds || [];
+    if (!c) return Promise.reject(new Error('A trip needs a first day and a last day.'));
     c.updated = new Date().toISOString(); if (!c.created) c.created = c.updated;
-    return changeTrips(function (list) { return list.filter(function (x) { return x.id !== c.id; }).concat([c]); });
+    return changeTrips(function (list) { return list.filter(function (x) { return x.id !== c.id && gone.indexOf(x.id) < 0; }).concat([c]); });
   },
   deleteTrip: function (id) { return changeTrips(function (list) { return list.filter(function (x) { return x.id !== id; }); }); },
   /** A short summary of the trip, written by Claude from its entries. */

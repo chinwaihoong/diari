@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v27';
+var APP_VERSION = 'v28';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -495,7 +495,7 @@ var view = $('#view');
 /* ---------- trips: a name and a range of days; entries of those days belong to it ---------- */
 function normTrips(list) {
   return (Array.isArray(list) ? list : []).filter(function (t) {
-    return t && t.id && t.name && /^\d{4}-\d{2}-\d{2}$/.test(t.start) && /^\d{4}-\d{2}-\d{2}$/.test(t.end);
+    return t && t.id && /^\d{4}-\d{2}-\d{2}$/.test(t.start) && /^\d{4}-\d{2}-\d{2}$/.test(t.end);
   }).sort(function (a, b) { return a.start < b.start ? 1 : -1; });
 }
 S.trips = normTrips(lsGet('diari-trips'));
@@ -503,6 +503,13 @@ function setTrips(list) { S.trips = normTrips(list); lsSet('diari-trips', S.trip
 function tripById(id) { return S.trips.filter(function (t) { return t.id === id; })[0] || null; }
 function tripOf(day) { return S.trips.filter(function (t) { return t.start <= day && day <= t.end; })[0] || null; }
 function tripEntries(t) { return S.entries.filter(function (e) { var d = e.date.slice(0, 10); return t.start <= d && d <= t.end; }); }
+/** What a trip is called: the name given to it, or else the title of its first entry. */
+function tripLabel(t) {
+  if (t.name) return t.name;
+  var first = tripEntries(t).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; }).filter(function (e) { return e.title; })[0];
+  return first ? first.title : 'Trip';
+}
+function dayShift(day, n) { var d = parseD(day + 'T12:00'); d.setDate(d.getDate() + n); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
 function dayNum(t, day) { return Math.round((parseD(day + 'T00:00') - parseD(t.start + 'T00:00')) / 864e5) + 1; }
 function tripLength(t) { return dayNum(t, t.end); }
 function fmtRange(a, b) {
@@ -521,7 +528,7 @@ function foldedTrips() { return lsGet('diari-trip-folded') || {}; }
 function tripHeadHTML(t, folded) {
   return '<div class="trip-head' + (folded ? ' folded' : '') + '" data-trip="' + esc(t.id) + '" role="button" tabindex="0">' +
     '<span class="th-ico">' + I.trip + '</span>' +
-    '<span class="th-main"><b>' + esc(t.name) + '</b><span>' + esc(fmtRange(t.start, t.end)) + ' · ' + esc(tripCounts(t)) + '</span></span>' +
+    '<span class="th-main"><b>' + esc(tripLabel(t)) + '</b><span>' + esc(fmtRange(t.start, t.end)) + ' · ' + esc(tripCounts(t)) + '</span></span>' +
     '<button class="icon-btn th-fold" data-trip-fold="' + esc(t.id) + '" aria-expanded="' + (folded ? 'false' : 'true') + '" aria-label="' + (folded ? 'Show' : 'Hide') + ' this trip\'s entries">' + I.chevD + '</button></div>';
 }
 
@@ -656,7 +663,7 @@ function renderCalendar() {
     '<button class="icon-btn" data-cal="1" aria-label="Next month">' + I.chevR + '</button></div>';
   var tp = S.tripPick;
   if (tp) {
-    var what = tp.editId ? 'Changing the dates of “' + esc(tp.name) + '”. ' : '';
+    var what = tp.editId ? 'Changing the dates of this trip. ' : '';
     html += '<div class="pick-bar" role="status"><span>' + what + (tp.start ? 'First day: <b>' + esc(fmtDayMonth(tp.start + 'T00:00')) + '</b>. Now tap the <b>last day</b>.' : 'Tap the <b>first day</b> of the trip.') + '</span>' +
       '<button class="btn ghost" data-trip-cancel>Cancel</button></div>';
   }
@@ -668,11 +675,11 @@ function renderCalendar() {
     var withMedia = null;
     list.forEach(function (e) { if (!withMedia && e.media[0] && e.media[0].thumb) withMedia = e.media[0]; });
     var tr = tripOf(key); if (tr && tp && tp.editId === tr.id) tr = null;   // its dates are being changed
-    var cls = 'day' + (list.length ? ' has' : '') + (withMedia ? ' photo' : '') + (key === tk ? ' today' : '') + (key === S.calDay && !tp ? ' sel' : '') +
-      (tr ? ' trip' : '') + (tp && tp.start === key ? ' pick' : '');
+    var cls = 'day' + (list.length ? ' has' : '') + (withMedia ? ' photo' : '') + (key === tk ? ' today' : '') + (key === S.calDay && !tp && !(tr && tripOf(S.calDay) === tr) ? ' sel' : '') +
+      (tr ? ' trip' : '') + (tp && tp.start === key ? ' pick' : '') + (tr && !tp && tripOf(S.calDay) === tr ? ' tsel' : '');
     var dots = list.length ? '<span class="dot">' + list.slice(0, 3).map(function () { return '<i></i>'; }).join('') + '</span>' : '';
     var band = tr ? '<span class="tband' + (key === tr.start || col === 0 ? ' s' : '') + (key === tr.end || col === 6 || d === days ? ' e' : '') + '"></span>' : '';
-    html += '<button class="' + cls + '" data-day="' + key + '" aria-label="' + esc(fmtDayMonth(key + 'T00:00')) + ', ' + plural(list.length, 'entry', 'entries') + (tr ? ', ' + esc(tr.name) : '') + '"' + (key === S.calDay && !tp ? ' aria-pressed="true"' : '') + '>' +
+    html += '<button class="' + cls + '" data-day="' + key + '" aria-label="' + esc(fmtDayMonth(key + 'T00:00')) + ', ' + plural(list.length, 'entry', 'entries') + (tr ? ', day ' + dayNum(tr, key) + ' of a trip' : '') + '"' + (key === S.calDay && !tp ? ' aria-pressed="true"' : '') + '>' +
       (withMedia ? imgTag(withMedia.thumb) : '') + '<span class="n">' + d + '</span>' + dots + band + '</button>';
   }
   html += '</div>';
@@ -681,17 +688,92 @@ function renderCalendar() {
   var first0 = S.cal + '-01', last0 = S.cal + '-' + pad(days);
   var here = S.trips.filter(function (t) { return t.start <= last0 && t.end >= first0; }).slice().reverse();
   html += '<div class="trip-list">' + here.map(function (t) {
-    return '<button class="trip-chip" data-trip="' + esc(t.id) + '">' + I.trip + '<span><b>' + esc(t.name) + '</b> ' + esc(fmtRange(t.start, t.end)) + '</span></button>';
-  }).join('') + '<button class="trip-chip new" data-trip-new>' + I.plus + '<span>New trip</span></button></div>';
-  var sel = (byDay[S.calDay] || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+    return '<button class="trip-chip" data-trip="' + esc(t.id) + '">' + I.trip + '<span><b>' + esc(tripLabel(t)) + '</b> ' + esc(fmtRange(t.start, t.end)) + '</span></button>';
+  }).join('') + '</div><p class="cal-hint">Trip? Press and hold a day, then drag to the last day to join them.</p>';
   var st = tripOf(S.calDay);
-  html += '<div class="day-list"><h3>' + esc(fmtDayMonth(S.calDay + 'T00:00')) +
-    (st ? ' <button class="day-trip" data-trip="' + esc(st.id) + '">Day ' + dayNum(st, S.calDay) + ' of ' + esc(st.name) + '</button>' : '') + '</h3>';
-  if (sel.length) html += sel.map(function (e, i) { return cardHTML(e, false); }).join('');
-  else html += '<p class="none">No entry on this day. Tap + to write one.</p>';
-  html += '</div>';
+  if (st) {
+    // A trip works like one long day: tapping any of its days shows all of it.
+    var all = tripEntries(st).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+    html += '<div class="day-list"><h3>' + esc(fmtRange(st.start, st.end)) + ' <button class="day-trip" data-trip="' + esc(st.id) + '">' + plural(tripLength(st), 'day') + ' · Open</button></h3>';
+    if (all.length) html += all.map(function (e) { return cardHTML(e, false); }).join('');
+    else html += '<p class="none">No entries for these days yet. Tap + to write one for ' + esc(fmtDayMonth(S.calDay + 'T00:00')) + '.</p>';
+    html += '</div>';
+  } else {
+    var sel = (byDay[S.calDay] || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
+    html += '<div class="day-list"><h3>' + esc(fmtDayMonth(S.calDay + 'T00:00')) + '</h3>';
+    if (sel.length) html += sel.map(function (e, i) { return cardHTML(e, false); }).join('');
+    else html += '<p class="none">No entry on this day. Tap + to write one.</p>';
+    html += '</div>';
+  }
   view.innerHTML = html;
 }
+
+/* ---------- joining days into a trip: press and hold a day, drag to another ---------- */
+var Drag = { timer: 0, on: false, start: '', cur: '', x: 0, y: 0, until: 0, touchAt: 0 };
+function dragDays() { var a = Drag.start, b = Drag.cur || Drag.start; return a <= b ? [a, b] : [b, a]; }
+function dragPaint() {
+  var r = Drag.on ? dragDays() : null;
+  $$('.cal .day[data-day]').forEach(function (d) { var k = d.getAttribute('data-day'); d.classList.toggle('drag', !!r && r[0] <= k && k <= r[1]); });
+}
+function dragArm(day, x, y) {
+  if (S.tripPick || !day) return;
+  clearTimeout(Drag.timer);
+  Drag.start = day; Drag.cur = day; Drag.x = x; Drag.y = y;
+  Drag.timer = setTimeout(function () {
+    Drag.timer = 0; Drag.on = true;
+    try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) {}
+    $('.cal') && $('.cal').classList.add('dragging');
+    dragPaint();
+  }, 380);
+}
+function dragMove(x, y) {
+  if (!Drag.on) {
+    if (Drag.timer && Math.abs(x - Drag.x) + Math.abs(y - Drag.y) > 12) { clearTimeout(Drag.timer); Drag.timer = 0; }   // a scroll, not a hold
+    return;
+  }
+  var el = document.elementFromPoint(x, y), d = el && el.closest && el.closest('.cal .day[data-day]');
+  if (d && d.getAttribute('data-day') !== Drag.cur) { Drag.cur = d.getAttribute('data-day'); dragPaint(); }
+}
+function dragEnd(mouse) {
+  clearTimeout(Drag.timer); Drag.timer = 0;
+  if (!Drag.on) return;
+  Drag.on = false; if (mouse) Drag.until = Date.now() + 350;      // the click that ends a mouse drag does not also pick a day (a touch drag makes no click)
+  var r = dragDays();
+  if (r[0] === r[1]) { dragPaint(); $('.cal') && $('.cal').classList.remove('dragging'); toast('Keep holding and drag to another day to join days into a trip.', 3500); return; }
+  if (fresh(5)) joinDays(r[0], r[1]);
+}
+/** Joins the days into one trip; a trip it overlaps or touches becomes part of it. */
+function joinDays(a, b) {
+  var near = S.trips.filter(function (t) { return t.start <= dayShift(b, 1) && dayShift(a, -1) <= t.end; }).sort(function (x, y) { return x.start < y.start ? -1 : 1; });
+  var keep = near[0], start = a, end = b;
+  near.forEach(function (t) { if (t.start < start) start = t.start; if (t.end > end) end = t.end; });
+  var t = keep ? Object.assign({}, keep, { start: start, end: end }) : { id: 't' + Date.now().toString(36) + rid(4), name: '', start: start, end: end };
+  API.saveTrip(t, near.slice(1).map(function (x) { return x.id; })).then(function (list) {
+    setTrips(list); S.calDay = a; S.cal = a.slice(0, 7); S.calPicked = true; render();
+    toast((keep ? 'Trip now ' : 'Days joined: ') + fmtRange(start, end) + ' (' + plural(dayNum({ start: start }, end), 'day') + ')');
+  }).catch(function (err) { render(); fail(err); });
+}
+view.addEventListener('touchstart', function (ev) {
+  Drag.touchAt = Date.now();
+  var d = ev.target.closest && ev.target.closest('.cal .day[data-day]');
+  if (!d || ev.touches.length > 1) { clearTimeout(Drag.timer); Drag.timer = 0; return; }
+  dragArm(d.getAttribute('data-day'), ev.touches[0].clientX, ev.touches[0].clientY);
+}, { passive: true });
+view.addEventListener('touchmove', function (ev) {
+  if (Drag.on) ev.preventDefault();                                // the page stays still while choosing days
+  dragMove(ev.touches[0].clientX, ev.touches[0].clientY);
+}, { passive: false });
+view.addEventListener('touchend', function (ev) { if (Drag.on) ev.preventDefault(); dragEnd(); });
+view.addEventListener('touchcancel', function () { clearTimeout(Drag.timer); Drag.timer = 0; if (Drag.on) { Drag.on = false; dragPaint(); } });
+// With a mouse on a PC: hold the button down on a day and drag.
+view.addEventListener('mousedown', function (ev) {
+  if (ev.button !== 0 || Date.now() - Drag.touchAt < 1000) return;
+  var d = ev.target.closest && ev.target.closest('.cal .day[data-day]');
+  if (d) dragArm(d.getAttribute('data-day'), ev.clientX, ev.clientY);
+});
+window.addEventListener('mousemove', function (ev) { if (Date.now() - Drag.touchAt > 1000 && (Drag.on || Drag.timer)) dragMove(ev.clientX, ev.clientY); });
+window.addEventListener('mouseup', function () { if (Date.now() - Drag.touchAt > 1000) dragEnd(true); });
+view.addEventListener('contextmenu', function (ev) { if (ev.target.closest && ev.target.closest('.cal .day')) ev.preventDefault(); });
 
 /* ---------- making a trip: tap the first day, then the last day ---------- */
 function startTripPick(edit) {
@@ -704,8 +786,9 @@ function pickTripDay(day) {
   var tp = S.tripPick;
   if (!tp.start) { tp.start = day; render(); return; }
   var a = tp.start < day ? tp.start : day, b = tp.start < day ? day : tp.start;
+  if (!tp.editId) { S.tripPick = null; joinDays(a, b); return; }
   var clash = S.trips.filter(function (t) { return t.id !== tp.editId && t.start <= b && a <= t.end; })[0];
-  if (clash) { tp.start = ''; render(); toast('Those days overlap “' + clash.name + '” (' + fmtRange(clash.start, clash.end) + '). Tap the first day again.', 5000); return; }
+  if (clash) { tp.start = ''; render(); toast('Those days overlap another trip (' + fmtRange(clash.start, clash.end) + '). Tap the first day again.', 5000); return; }
   if (tp.editId) {
     var t = tripById(tp.editId);
     S.tripPick = null;
@@ -713,11 +796,6 @@ function pickTripDay(day) {
     saveTrip(Object.assign({}, t, { start: a, end: b }), 'Trip dates changed');
     return;
   }
-  promptDlg({ title: 'Name this trip', text: fmtRange(a, b) + ' · ' + plural(dayNum({ start: a }, b), 'day'), placeholder: 'e.g. Penang trip', ok: 'Save trip' }).then(function (name) {
-    if (!name) return;                                      // cancelled: still picking, so the days can be tapped again
-    S.tripPick = null;
-    saveTrip({ id: 't' + Date.now().toString(36) + rid(4), name: name, start: a, end: b }, 'Trip saved');
-  });
 }
 function saveTrip(t, done) {
   return API.saveTrip(t).then(function (list) {
@@ -804,7 +882,7 @@ function fillTrip() {
   if (!t) { if (tripSheet.classList.contains('open')) Nav.pop(); return; }
   var list = tripEntries(t).slice().sort(byDate), media = tripMedia(list);
   var html = '<p class="ev-date">Trip · ' + esc(fmtRange(t.start, t.end)) + ' · ' + plural(tripLength(t), 'day') + '</p>' +
-    '<h1 class="ev-title">' + esc(t.name) + '</h1><p class="trip-stats">' + esc(tripCounts(t)) + '</p>';
+    '<h1 class="ev-title">' + esc(tripLabel(t)) + '</h1><p class="trip-stats">' + esc(tripCounts(t)) + '</p>';
   if (t.summary) html += '<div class="trip-sum"><p>' + esc(t.summary).replace(/\n+/g, '</p><p>') + '</p>' +
     (S.aiTitles && list.length ? '<button class="btn ghost small" data-trip-sum>' + I.spark + 'Write it again</button>' : '') + '</div>';
   else if (S.aiTitles && list.length) html += '<p><button class="btn soft" data-trip-sum>' + I.spark + 'Write a summary with Claude</button></p>';
@@ -823,8 +901,9 @@ function fillTrip() {
         (e.body.trim() ? '<div class="prose">' + md(e.body) + '</div>' : '') + '</article>';
     });
   } else html += '<p class="none">No entries for these days yet. Anything you write for a day of this trip shows up here.</p>';
-  html += '<div class="trip-acts"><button class="btn soft" data-trip-rename>Rename</button><button class="btn soft" data-trip-dates>Change dates</button>' +
-    '<button class="btn ghost danger-text" data-trip-del>' + I.trash + 'Delete trip</button></div>';
+  html += '<div class="trip-acts"><button class="btn soft" data-trip-rename>' + (t.name ? 'Rename' : 'Give it a name') + '</button><button class="btn soft" data-trip-dates>Change dates</button>' +
+    '<button class="btn ghost danger-text" data-trip-del>Unjoin these days</button></div>' +
+    (t.name ? '' : '<p class="cal-hint">It is called by its first entry’s title. A name is optional.</p>');
   box.innerHTML = html;
   observeImgs(box);
 }
@@ -845,17 +924,17 @@ tripSheet.addEventListener('click', function (ev) {
     return;
   }
   if (tg.closest('[data-trip-rename]')) {
-    promptDlg({ title: 'Rename the trip', value: t.name, ok: 'Save' }).then(function (name) {
+    promptDlg({ title: t.name ? 'Rename the trip' : 'Name this trip', value: t.name || tripLabel(t), ok: 'Save' }).then(function (name) {
       if (!name || name === t.name) return;
-      API.saveTrip(Object.assign({}, t, { name: name })).then(function (l) { setTrips(l); render(); fillTrip(); toast('Trip renamed'); }).catch(fail);
+      API.saveTrip(Object.assign({}, t, { name: name })).then(function (l) { setTrips(l); render(); fillTrip(); toast('Trip named'); }).catch(fail);
     });
     return;
   }
   if (tg.closest('[data-trip-dates]')) { Nav.pop(); startTripPick(t); return; }
   if (tg.closest('[data-trip-del]')) {
-    confirmDlg({ title: 'Delete the trip “' + t.name + '”?', text: 'Only the trip goes. Your entries, photos and videos stay in your journal.', ok: 'Delete trip', danger: true }).then(function (yes) {
+    confirmDlg({ title: 'Unjoin these days?', text: fmtRange(t.start, t.end) + ' go back to separate days. Your entries, photos and videos stay in your journal.', ok: 'Unjoin', danger: true }).then(function (yes) {
       if (!yes) return;
-      API.deleteTrip(t.id).then(function (l) { setTrips(l); if (S.openTrip === t.id) Nav.pop(); render(); toast('Trip deleted'); }).catch(fail);
+      API.deleteTrip(t.id).then(function (l) { setTrips(l); if (S.openTrip === t.id) Nav.pop(); render(); toast('Days unjoined'); }).catch(fail);
     });
   }
 });
@@ -898,7 +977,7 @@ function entryHTML(e) {
   if (c.videos) foot.push(plural(c.videos, 'video'));
   var tr = tripOf(e.date.slice(0, 10));
   return '<p class="ev-date">' + esc(fmtLong(e.date)) + ' · ' + fmtTime(e.date) + '</p>' +
-    (tr ? '<button class="trip-tag" data-trip-open="' + esc(tr.id) + '">' + I.trip + 'Day ' + dayNum(tr, e.date.slice(0, 10)) + ' of ' + esc(tr.name) + '</button>' : '') +
+    (tr ? '<button class="trip-tag" data-trip-open="' + esc(tr.id) + '">' + I.trip + 'Day ' + dayNum(tr, e.date.slice(0, 10)) + ' of ' + esc(tripLabel(tr)) + '</button>' : '') +
     (e.title ? '<h1 class="ev-title">' + esc(e.title) + '</h1>' : '<div style="height:14px"></div>') +
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
@@ -2618,6 +2697,7 @@ function wireShell() {
   $$('.tab').forEach(function (t) { t.onclick = function () { setView(t.getAttribute('data-view')); }; });
 
   view.addEventListener('click', function (ev) {
+    if (Date.now() < Drag.until) return;
     var t = ev.target;
     // trips
     var tf = t.closest('[data-trip-fold]');

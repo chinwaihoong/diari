@@ -357,6 +357,11 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
 .day .tband.e{right:5px;border-top-right-radius:3px;border-bottom-right-radius:3px}
 .day.trip .dot{bottom:12px}
 .day.pick{outline:3px solid var(--mark);outline-offset:-2px;z-index:4}
+.cal .day{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;touch-action:manipulation}
+.day.drag{outline:3px solid var(--mark);outline-offset:-2px;z-index:4}
+.day.drag::before{content:"";position:absolute;inset:0;background:var(--mark);opacity:.38;z-index:3;border-radius:10px}
+.day.tsel{box-shadow:inset 0 0 0 2px var(--mark)}
+.cal-hint{color:var(--muted);font-size:13px;margin:10px 2px 0}
 .pick-bar{display:flex;align-items:center;gap:10px;background:var(--mark-soft);border-radius:12px;padding:8px 6px 8px 14px;margin:0 0 10px;font-size:14px;line-height:1.4}
 .pick-bar span{flex:1}
 .trip-list{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 0}
