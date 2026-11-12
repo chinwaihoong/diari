@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v26';
+var APP_VERSION = 'v27';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -45,6 +45,8 @@ var I = {
   addMedia: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>',
   image: '<svg ' + SV + '><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.8"/><path d="m21 15-4.5-4.5L5 21"/></svg>',
   x: '<svg ' + SV + ' stroke-width="2.4"><path d="M17 7 7 17M7 7l10 10"/></svg>',
+  trip: '<svg ' + SV + '><rect x="3" y="7" width="18" height="13" rx="2.5"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7"/><path d="M3 12.5h18"/></svg>',
+  chevD: '<svg ' + SV + ' stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
   ext: '<svg ' + SV + '><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"/></svg>',
   spark: '<svg ' + SV + '><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>'
 };
@@ -490,8 +492,41 @@ function counts(list) {
 /* ================================================================ */
 var view = $('#view');
 
+/* ---------- trips: a name and a range of days; entries of those days belong to it ---------- */
+function normTrips(list) {
+  return (Array.isArray(list) ? list : []).filter(function (t) {
+    return t && t.id && t.name && /^\d{4}-\d{2}-\d{2}$/.test(t.start) && /^\d{4}-\d{2}-\d{2}$/.test(t.end);
+  }).sort(function (a, b) { return a.start < b.start ? 1 : -1; });
+}
+S.trips = normTrips(lsGet('diari-trips'));
+function setTrips(list) { S.trips = normTrips(list); lsSet('diari-trips', S.trips); }
+function tripById(id) { return S.trips.filter(function (t) { return t.id === id; })[0] || null; }
+function tripOf(day) { return S.trips.filter(function (t) { return t.start <= day && day <= t.end; })[0] || null; }
+function tripEntries(t) { return S.entries.filter(function (e) { var d = e.date.slice(0, 10); return t.start <= d && d <= t.end; }); }
+function dayNum(t, day) { return Math.round((parseD(day + 'T00:00') - parseD(t.start + 'T00:00')) / 864e5) + 1; }
+function tripLength(t) { return dayNum(t, t.end); }
+function fmtRange(a, b) {
+  var x = parseD(a + 'T00:00'), y = parseD(b + 'T00:00'), m = function (d) { return MON[d.getMonth()].slice(0, 3); };
+  if (a === b) return x.getDate() + ' ' + m(x) + ' ' + x.getFullYear();
+  if (x.getFullYear() !== y.getFullYear()) return x.getDate() + ' ' + m(x) + ' ' + x.getFullYear() + ' – ' + y.getDate() + ' ' + m(y) + ' ' + y.getFullYear();
+  if (x.getMonth() !== y.getMonth()) return x.getDate() + ' ' + m(x) + ' – ' + y.getDate() + ' ' + m(y) + ' ' + y.getFullYear();
+  return x.getDate() + '–' + y.getDate() + ' ' + m(x) + ' ' + y.getFullYear();
+}
+function tripCounts(t) {
+  var c = counts(tripEntries(t)), bits = [plural(c.entries, 'entry', 'entries')];
+  if (c.photos) bits.push(plural(c.photos, 'photo')); if (c.videos) bits.push(plural(c.videos, 'video'));
+  return bits.join(' · ');
+}
+function foldedTrips() { return lsGet('diari-trip-folded') || {}; }
+function tripHeadHTML(t, folded) {
+  return '<div class="trip-head' + (folded ? ' folded' : '') + '" data-trip="' + esc(t.id) + '" role="button" tabindex="0">' +
+    '<span class="th-ico">' + I.trip + '</span>' +
+    '<span class="th-main"><b>' + esc(t.name) + '</b><span>' + esc(fmtRange(t.start, t.end)) + ' · ' + esc(tripCounts(t)) + '</span></span>' +
+    '<button class="icon-btn th-fold" data-trip-fold="' + esc(t.id) + '" aria-expanded="' + (folded ? 'false' : 'true') + '" aria-label="' + (folded ? 'Show' : 'Hide') + ' this trip\'s entries">' + I.chevD + '</button></div>';
+}
+
 function setView(v) {
-  if (v !== S.view) S.calPicked = false;
+  if (v !== S.view) { S.calPicked = false; if (v !== 'calendar') S.tripPick = null; }
   S.view = v;
   $$('.tab').forEach(function (t) { if (t.getAttribute('data-view') === v) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current'); });
   render();
@@ -518,9 +553,10 @@ function render() {
   else if (S.view === 'media') renderMedia();
   else renderTimeline();
   observeImgs(view);
+  if (S.openTrip && !$('.lb')) fillTrip();
 }
 
-function cardHTML(e, sameDay) {
+function cardHTML(e, sameDay, extra) {
   var d = parseD(e.date), m0 = e.media[0];
   var ex = plain(e.body).slice(0, 220);
   var thumb = '';
@@ -537,7 +573,7 @@ function cardHTML(e, sameDay) {
   if (e.pending) meta.push('<b class="pend">' + pendingText() + '</b>');
   if (Copies.has(e.id)) meta.push('<b class="pend" data-copy="' + esc(e.id) + '">Preparing video…</b>');
   if (Uploads.count(e.id)) meta.push('<b class="pend">' + Uploads.text(e.id) + '</b>');
-  return '<button class="card' + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + (e.id === S.flashId ? ' justsaved' : '') + '" data-open="' + esc(e.id) + '">' +
+  return '<button class="card' + (extra || '') + (sameDay ? ' same-day' : '') + (e.date.slice(0, 10) === todayKey() ? ' is-today' : '') + (e.id === S.flashId ? ' justsaved' : '') + '" data-open="' + esc(e.id) + '">' +
     '<span class="dt" aria-hidden="true"><span class="dw">' + DOW[d.getDay()].slice(0, 3) + '</span><span class="dn">' + d.getDate() + '</span></span>' +
     '<span style="min-width:0;display:block">' +
       (e.title ? '<span class="c-title">' + esc(e.title) + '</span>' : '') +
@@ -547,15 +583,19 @@ function cardHTML(e, sameDay) {
 }
 
 function listHTML(list) {
-  var html = '', curMonth = '', prevDay = '', monthCounts = {};
+  var html = '', curMonth = '', prevDay = '', monthCounts = {}, curTrip = null, folded = foldedTrips();
   list.forEach(function (e) { var k = e.date.slice(0, 7); monthCounts[k] = (monthCounts[k] || 0) + 1; });
   list.forEach(function (e) {
-    var k = e.date.slice(0, 7), day = e.date.slice(0, 10);
-    if (k !== curMonth) {
+    var k = e.date.slice(0, 7), day = e.date.slice(0, 10), tr = tripOf(day);
+    var same = !!(tr && curTrip && curTrip.id === tr.id);          // a trip's entries stay together, even across a month
+    if (k !== curMonth && !same) {
       curMonth = k; prevDay = '';
       html += '<div class="month"><h2>' + monthName(k) + '</h2><span>' + plural(monthCounts[k], 'entry', 'entries') + '</span></div>';
     }
-    html += cardHTML(e, day === prevDay);
+    if (tr && !same) { html += tripHeadHTML(tr, folded[tr.id]); prevDay = ''; }
+    curTrip = tr;
+    if (tr && folded[tr.id]) return;
+    html += cardHTML(e, day === prevDay, tr ? ' in-trip' : '');
     prevDay = day;
   });
   return html;
@@ -614,25 +654,96 @@ function renderCalendar() {
     '<button class="icon-btn" data-cal="-1" aria-label="Previous month">' + I.chevL + '</button>' +
     (S.cal !== tk.slice(0, 7) ? '<button class="btn ghost" data-cal="0">Today</button>' : '') +
     '<button class="icon-btn" data-cal="1" aria-label="Next month">' + I.chevR + '</button></div>';
-  html += '<div class="cal" role="grid">';
+  var tp = S.tripPick;
+  if (tp) {
+    var what = tp.editId ? 'Changing the dates of “' + esc(tp.name) + '”. ' : '';
+    html += '<div class="pick-bar" role="status"><span>' + what + (tp.start ? 'First day: <b>' + esc(fmtDayMonth(tp.start + 'T00:00')) + '</b>. Now tap the <b>last day</b>.' : 'Tap the <b>first day</b> of the trip.') + '</span>' +
+      '<button class="btn ghost" data-trip-cancel>Cancel</button></div>';
+  }
+  html += '<div class="cal' + (tp ? ' picking' : '') + '" role="grid">';
   ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].forEach(function (d) { html += '<div class="dow">' + d + '</div>'; });
   for (var i = 0; i < off; i++) html += '<span class="day blank" aria-hidden="true"></span>';
   for (var d = 1; d <= days; d++) {
-    var key = S.cal + '-' + pad(d), list = byDay[key] || [];
+    var key = S.cal + '-' + pad(d), list = byDay[key] || [], col = (off + d - 1) % 7;
     var withMedia = null;
     list.forEach(function (e) { if (!withMedia && e.media[0] && e.media[0].thumb) withMedia = e.media[0]; });
-    var cls = 'day' + (list.length ? ' has' : '') + (withMedia ? ' photo' : '') + (key === tk ? ' today' : '') + (key === S.calDay ? ' sel' : '');
+    var tr = tripOf(key); if (tr && tp && tp.editId === tr.id) tr = null;   // its dates are being changed
+    var cls = 'day' + (list.length ? ' has' : '') + (withMedia ? ' photo' : '') + (key === tk ? ' today' : '') + (key === S.calDay && !tp ? ' sel' : '') +
+      (tr ? ' trip' : '') + (tp && tp.start === key ? ' pick' : '');
     var dots = list.length ? '<span class="dot">' + list.slice(0, 3).map(function () { return '<i></i>'; }).join('') + '</span>' : '';
-    html += '<button class="' + cls + '" data-day="' + key + '" aria-label="' + esc(fmtDayMonth(key + 'T00:00')) + ', ' + plural(list.length, 'entry', 'entries') + '"' + (key === S.calDay ? ' aria-pressed="true"' : '') + '>' +
-      (withMedia ? imgTag(withMedia.thumb) : '') + '<span class="n">' + d + '</span>' + dots + '</button>';
+    var band = tr ? '<span class="tband' + (key === tr.start || col === 0 ? ' s' : '') + (key === tr.end || col === 6 || d === days ? ' e' : '') + '"></span>' : '';
+    html += '<button class="' + cls + '" data-day="' + key + '" aria-label="' + esc(fmtDayMonth(key + 'T00:00')) + ', ' + plural(list.length, 'entry', 'entries') + (tr ? ', ' + esc(tr.name) : '') + '"' + (key === S.calDay && !tp ? ' aria-pressed="true"' : '') + '>' +
+      (withMedia ? imgTag(withMedia.thumb) : '') + '<span class="n">' + d + '</span>' + dots + band + '</button>';
   }
   html += '</div>';
+  if (tp) { view.innerHTML = html; return; }
+  // Trips in this month, and making a new one
+  var first0 = S.cal + '-01', last0 = S.cal + '-' + pad(days);
+  var here = S.trips.filter(function (t) { return t.start <= last0 && t.end >= first0; }).slice().reverse();
+  html += '<div class="trip-list">' + here.map(function (t) {
+    return '<button class="trip-chip" data-trip="' + esc(t.id) + '">' + I.trip + '<span><b>' + esc(t.name) + '</b> ' + esc(fmtRange(t.start, t.end)) + '</span></button>';
+  }).join('') + '<button class="trip-chip new" data-trip-new>' + I.plus + '<span>New trip</span></button></div>';
   var sel = (byDay[S.calDay] || []).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; });
-  html += '<div class="day-list"><h3>' + esc(fmtDayMonth(S.calDay + 'T00:00')) + '</h3>';
+  var st = tripOf(S.calDay);
+  html += '<div class="day-list"><h3>' + esc(fmtDayMonth(S.calDay + 'T00:00')) +
+    (st ? ' <button class="day-trip" data-trip="' + esc(st.id) + '">Day ' + dayNum(st, S.calDay) + ' of ' + esc(st.name) + '</button>' : '') + '</h3>';
   if (sel.length) html += sel.map(function (e, i) { return cardHTML(e, false); }).join('');
   else html += '<p class="none">No entry on this day. Tap + to write one.</p>';
   html += '</div>';
   view.innerHTML = html;
+}
+
+/* ---------- making a trip: tap the first day, then the last day ---------- */
+function startTripPick(edit) {
+  S.tripPick = { start: '', editId: edit ? edit.id : '', name: edit ? edit.name : '' };
+  S.calPicked = false;
+  if (edit) S.cal = edit.start.slice(0, 7);
+  if (S.view !== 'calendar') setView('calendar'); else { render(); window.scrollTo(0, 0); }
+}
+function pickTripDay(day) {
+  var tp = S.tripPick;
+  if (!tp.start) { tp.start = day; render(); return; }
+  var a = tp.start < day ? tp.start : day, b = tp.start < day ? day : tp.start;
+  var clash = S.trips.filter(function (t) { return t.id !== tp.editId && t.start <= b && a <= t.end; })[0];
+  if (clash) { tp.start = ''; render(); toast('Those days overlap “' + clash.name + '” (' + fmtRange(clash.start, clash.end) + '). Tap the first day again.', 5000); return; }
+  if (tp.editId) {
+    var t = tripById(tp.editId);
+    S.tripPick = null;
+    if (!t) { render(); return; }
+    saveTrip(Object.assign({}, t, { start: a, end: b }), 'Trip dates changed');
+    return;
+  }
+  promptDlg({ title: 'Name this trip', text: fmtRange(a, b) + ' · ' + plural(dayNum({ start: a }, b), 'day'), placeholder: 'e.g. Penang trip', ok: 'Save trip' }).then(function (name) {
+    if (!name) return;                                      // cancelled: still picking, so the days can be tapped again
+    S.tripPick = null;
+    saveTrip({ id: 't' + Date.now().toString(36) + rid(4), name: name, start: a, end: b }, 'Trip saved');
+  });
+}
+function saveTrip(t, done) {
+  return API.saveTrip(t).then(function (list) {
+    setTrips(list); S.calDay = t.start; S.cal = t.start.slice(0, 7); render(); toast(done);
+    if (!S.openTrip) openTrip(t.id);
+  }).catch(function (err) { render(); fail(err); });
+}
+
+/** Asks for one line of text. Resolves with it, or '' if cancelled. */
+function promptDlg(o) {
+  return new Promise(function (resolve) {
+    var result = '';
+    var w = el('<div class="dlg-wrap" role="dialog" aria-modal="true" aria-labelledby="dlg-t"><div class="dlg">' +
+      '<h2 id="dlg-t">' + esc(o.title) + '</h2>' + (o.text ? '<p>' + esc(o.text) + '</p>' : '') +
+      '<input class="dlg-in" type="text" maxlength="80" autocomplete="off" placeholder="' + esc(o.placeholder || '') + '" value="' + esc(o.value || '') + '">' +
+      '<div class="dlg-acts"><button type="button" class="btn ghost" data-no>Cancel</button><button type="button" class="btn primary" data-ok>' + esc(o.ok || 'OK') + '</button></div></div></div>');
+    document.body.appendChild(w); lockScroll();
+    Nav.push(function () { w.remove(); lockScroll(); resolve(result); });
+    var inp = $('.dlg-in', w);
+    var ok = function () { var v = inp.value.replace(/\s+/g, ' ').trim(); if (!v) { inp.focus(); return; } result = v; Nav.pop(); };
+    $('[data-ok]', w).onclick = ok;
+    inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); ok(); } });
+    $('[data-no]', w).onclick = function () { Nav.pop(); };
+    w.addEventListener('click', function (ev) { if (ev.target === w) Nav.pop(); });
+    setTimeout(function () { inp.focus(); inp.select(); }, 60);
+  });
 }
 
 function allMedia() {
@@ -674,6 +785,85 @@ function openSheet(sh, onClose) {
   Nav.push(function () { sh.classList.remove('open'); lockScroll(); if (onClose) onClose(); });
 }
 
+/* ---------- trip page ---------- */
+var tripSheet = $('#sheet-trip');
+function openTrip(id) {
+  if (!tripById(id)) return;
+  S.openTrip = id; fillTrip();
+  if (!tripSheet.classList.contains('open')) openSheet(tripSheet, function () { S.openTrip = null; stopVideos(tripSheet); });
+  else $('.sheet-body', tripSheet).scrollTop = 0;
+}
+function byDate(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; }
+function tripMedia(list) {
+  var out = [];
+  list.forEach(function (e) { e.media.forEach(function (m) { out.push(Object.assign({}, m, { entryId: e.id, date: e.date, title: e.title })); }); });
+  return out;
+}
+function fillTrip() {
+  var t = tripById(S.openTrip), box = $('#trip-in');
+  if (!t) { if (tripSheet.classList.contains('open')) Nav.pop(); return; }
+  var list = tripEntries(t).slice().sort(byDate), media = tripMedia(list);
+  var html = '<p class="ev-date">Trip · ' + esc(fmtRange(t.start, t.end)) + ' · ' + plural(tripLength(t), 'day') + '</p>' +
+    '<h1 class="ev-title">' + esc(t.name) + '</h1><p class="trip-stats">' + esc(tripCounts(t)) + '</p>';
+  if (t.summary) html += '<div class="trip-sum"><p>' + esc(t.summary).replace(/\n+/g, '</p><p>') + '</p>' +
+    (S.aiTitles && list.length ? '<button class="btn ghost small" data-trip-sum>' + I.spark + 'Write it again</button>' : '') + '</div>';
+  else if (S.aiTitles && list.length) html += '<p><button class="btn soft" data-trip-sum>' + I.spark + 'Write a summary with Claude</button></p>';
+  if (media.length) html += '<h2 class="trip-h">Photos and videos</h2><div class="mgrid">' + media.map(function (m, i) {
+    return '<button class="mt" data-tmi="' + i + '" aria-label="' + (m.type === 'video' ? 'Video' : 'Photo') + ' from ' + esc(fmtLong(m.date)) + '">' + thumbTag(m) +
+      (m.type === 'video' ? '<span class="badge">' + I.play + fmtDur(m.dur) + '</span>' : '') + '</button>';
+  }).join('') + '</div>';
+  if (list.length) {
+    html += '<h2 class="trip-h">Day by day</h2>';
+    var cur = '';
+    list.forEach(function (e) {
+      var d = e.date.slice(0, 10), c = counts([e]), bits = [fmtTime(e.date)];
+      if (d !== cur) { cur = d; html += '<h3 class="trip-day"><span>Day ' + dayNum(t, d) + '</span>' + esc(fmtDayMonth(d + 'T00:00')) + '</h3>'; }
+      if (c.photos) bits.push(plural(c.photos, 'photo')); if (c.videos) bits.push(plural(c.videos, 'video'));
+      html += '<article class="trip-entry" data-open="' + esc(e.id) + '" role="button" tabindex="0"><div class="te-head"><b>' + esc(e.title || 'Untitled') + '</b><span>' + bits.join(' · ') + '</span></div>' +
+        (e.body.trim() ? '<div class="prose">' + md(e.body) + '</div>' : '') + '</article>';
+    });
+  } else html += '<p class="none">No entries for these days yet. Anything you write for a day of this trip shows up here.</p>';
+  html += '<div class="trip-acts"><button class="btn soft" data-trip-rename>Rename</button><button class="btn soft" data-trip-dates>Change dates</button>' +
+    '<button class="btn ghost danger-text" data-trip-del>' + I.trash + 'Delete trip</button></div>';
+  box.innerHTML = html;
+  observeImgs(box);
+}
+tripSheet.addEventListener('click', function (ev) {
+  var tg = ev.target, t = tripById(S.openTrip);
+  if (tg.closest('[data-act="close"]')) { Nav.pop(); return; }
+  if (!t || tg.closest('a')) return;
+  var list = tripEntries(t).slice().sort(byDate);
+  var mi = tg.closest('[data-tmi]'); if (mi) { openLightbox(tripMedia(list), +mi.getAttribute('data-tmi'), true); return; }
+  var o = tg.closest('[data-open]'); if (o) { openEntry(o.getAttribute('data-open')); return; }
+  // Trip changes need the Google sign-in: renew it first if it is about to run out.
+  if (tg.closest('[data-trip-sum], [data-trip-rename], [data-trip-dates], [data-trip-del]') && !fresh(5)) return;
+  var sb = tg.closest('[data-trip-sum]');
+  if (sb) {
+    sb.disabled = true; sb.textContent = 'Writing…';
+    API.tripSummary(t, list).then(function (sum) { return API.saveTrip(Object.assign({}, t, { summary: sum, summaryAt: new Date().toISOString() })); })
+      .then(function (l) { setTrips(l); fillTrip(); }).catch(function (err) { fillTrip(); fail(err, 7000); });
+    return;
+  }
+  if (tg.closest('[data-trip-rename]')) {
+    promptDlg({ title: 'Rename the trip', value: t.name, ok: 'Save' }).then(function (name) {
+      if (!name || name === t.name) return;
+      API.saveTrip(Object.assign({}, t, { name: name })).then(function (l) { setTrips(l); render(); fillTrip(); toast('Trip renamed'); }).catch(fail);
+    });
+    return;
+  }
+  if (tg.closest('[data-trip-dates]')) { Nav.pop(); startTripPick(t); return; }
+  if (tg.closest('[data-trip-del]')) {
+    confirmDlg({ title: 'Delete the trip “' + t.name + '”?', text: 'Only the trip goes. Your entries, photos and videos stay in your journal.', ok: 'Delete trip', danger: true }).then(function (yes) {
+      if (!yes) return;
+      API.deleteTrip(t.id).then(function (l) { setTrips(l); if (S.openTrip === t.id) Nav.pop(); render(); toast('Trip deleted'); }).catch(fail);
+    });
+  }
+});
+tripSheet.addEventListener('keydown', function (ev) {
+  var o = ev.target.closest && ev.target.closest('.trip-entry');
+  if (o && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); openEntry(o.getAttribute('data-open')); }
+});
+
 /* ---------- entry view ---------- */
 var entrySheet = $('#sheet-entry');
 
@@ -706,7 +896,9 @@ function entryHTML(e) {
   var c = counts([e]), foot = [plural(c.words, 'word')];
   if (c.photos) foot.push(plural(c.photos, 'photo'));
   if (c.videos) foot.push(plural(c.videos, 'video'));
+  var tr = tripOf(e.date.slice(0, 10));
   return '<p class="ev-date">' + esc(fmtLong(e.date)) + ' · ' + fmtTime(e.date) + '</p>' +
+    (tr ? '<button class="trip-tag" data-trip-open="' + esc(tr.id) + '">' + I.trip + 'Day ' + dayNum(tr, e.date.slice(0, 10)) + ' of ' + esc(tr.name) + '</button>' : '') +
     (e.title ? '<h1 class="ev-title">' + esc(e.title) + '</h1>' : '<div style="height:14px"></div>') +
     galleryHTML(e) +
     '<div class="prose">' + md(e.body) + '</div>' +
@@ -1015,6 +1207,8 @@ entrySheet.addEventListener('click', function (ev) {
   }
   var tag = ev.target.closest('[data-tag]');
   if (tag) { Nav.pop(); showSearch('#' + tag.getAttribute('data-tag')); return; }
+  var to = ev.target.closest('[data-trip-open]');
+  if (to) { var tid = to.getAttribute('data-trip-open'); Nav.pop(); if (S.openTrip !== tid) openTrip(tid); return; }   // back to the trip if it was opened from there
   var gi = ev.target.closest('[data-gi]');
   if (gi) openGalleryItem(gi);
 });
@@ -1247,7 +1441,7 @@ function usd(v) { return v < 0.01 ? 'less than US$0.01' : 'about US$' + v.toFixe
 function creditHTML() {
   var u = API.claudeUse(), low = API.creditLow();
   var spent = !u.n ? 'Diari has not used Claude on this device this month.'
-    : 'This month on this device, Claude wrote ' + plural(u.n, 'title') + (u.unpriced && !u.usd ? '.' : ', costing ' + usd(u.usd) + '.');
+    : 'This month on this device, Diari used Claude ' + plural(u.n, 'time') + ' (titles and trip summaries)' + (u.unpriced && !u.usd ? '.' : ', costing ' + usd(u.usd) + '.');
   return '<div class="credit" id="credit">' +
     (low ? '<p class="credit-low"><b>Your Claude credit has run out.</b> New entries get their first sentence as the title until you top up.</p>' : '') +
     '<p class="muted">Your balance is shown on the Claude Console billing page (Claude does not share it with apps). Top up there, or turn on auto-reload so it never runs out.</p>' +
@@ -2411,6 +2605,7 @@ function wireShell() {
   $('[data-act="edit"]', entrySheet).innerHTML = I.edit + 'Edit';
   $('[data-act="delete"]', entrySheet).innerHTML = I.trash;
   $('[data-act="close"]', $('#sheet-settings')).innerHTML = I.back;
+  $('[data-act="close"]', tripSheet).innerHTML = I.back;
   var n = new Date();
   $('#today').textContent = DOW[n.getDay()].slice(0, 3) + ' ' + n.getDate() + ' ' + MON[n.getMonth()].slice(0, 3);
   $('#brand').textContent = APP_NAME;
@@ -2424,6 +2619,13 @@ function wireShell() {
 
   view.addEventListener('click', function (ev) {
     var t = ev.target;
+    // trips
+    var tf = t.closest('[data-trip-fold]');
+    if (tf) { var fid = tf.getAttribute('data-trip-fold'), fo = foldedTrips(); if (fo[fid]) delete fo[fid]; else fo[fid] = 1; lsSet('diari-trip-folded', fo); render(); return; }
+    if (t.closest('[data-trip-cancel]')) { S.tripPick = null; render(); return; }
+    if (t.closest('[data-trip-new]')) { if (fresh(5)) startTripPick(null); return; }
+    var th = t.closest('[data-trip]'); if (th) { openTrip(th.getAttribute('data-trip')); return; }
+    if (S.tripPick) { var pd = t.closest('[data-day]'); if (pd) { pickTripDay(pd.getAttribute('data-day')); return; } }
     var o = t.closest('[data-open]'); if (o) { openEntry(o.getAttribute('data-open')); return; }
     if (t.closest('[data-new]')) { if (fresh(3, { id: '' })) openEditor(null); return; }
     var no = t.closest('[data-new-on]'); if (no) { var nd = no.getAttribute('data-new-on'); if (fresh(3, { id: '', day: nd })) openEditor(null, nd); return; }
@@ -2592,6 +2794,7 @@ function boot() {
     if (r.setup || r.moveUnfinished) { showSetup(!!r.moveUnfinished, authMsg); return; }
     if (authMsg) toast(authMsg, 7000);
     S.entries = normList(r.index.entries); sortEntries(); Outbox.overlay();
+    if (r.trips) setTrips(r.trips);
     S.rootUrl = /^https:\/\/drive\.google\.com\//.test(r.rootUrl || '') ? r.rootUrl : ''; S.aiTitles = r.aiTitles || ''; S.loaded = true; cacheIndex(); render();
     Outbox.run();
     var left = Uploads.take();

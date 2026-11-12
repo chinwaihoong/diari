@@ -22,7 +22,7 @@ var DRIVE = 'https://www.googleapis.com/drive/v3';
 var UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
 var FOLDER = 'application/vnd.google-apps.folder';
 var ROOT_NAME = 'Journal', MEDIA_NAME = 'Media', PREVIEWS_NAME = 'Previews';
-var INDEX_NAME = 'journal-index.json', SETTINGS_NAME = 'diari-settings.json';
+var INDEX_NAME = 'journal-index.json', SETTINGS_NAME = 'diari-settings.json', TRIPS_NAME = 'diari-trips.json';
 var MEDIA_TAG = 'Journal attachment';            // set on every uploaded file; only these are ever trashed
 var ATTACH_MARK = '<!-- journal:attachments -->';
 var ID_RE = /^[A-Za-z0-9_-]{10,}$/;
@@ -345,6 +345,56 @@ function saveSettings(patch) {
       : createFile(r, SETTINGS_NAME, text, 'application/json').then(function (res) { s.fileId = res.id; });
     return p.then(function () { return s.data; });
   });
+}
+
+/* ================================================================ */
+/* Trips: a name and a range of days, kept in diari-trips.json       */
+/* ================================================================ */
+var DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+function cleanTrip(t) {
+  if (!t || !/^[A-Za-z0-9_-]{6,32}$/.test(String(t.id)) || !DAY_RE.test(String(t.start)) || !DAY_RE.test(String(t.end))) return null;
+  var name = String(t.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (!name) return null;
+  var a = String(t.start), b = String(t.end);
+  if (b < a) { var x = a; a = b; b = x; }
+  return { id: String(t.id), name: name, start: a, end: b, summary: String(t.summary || '').slice(0, 3000),
+    summaryAt: String(t.summaryAt || ''), created: String(t.created || ''), updated: String(t.updated || '') };
+}
+function readTrips(r) {
+  return findOne(r, TRIPS_NAME).then(function (f) {
+    if (!f) return { fileId: '', trips: [] };
+    return readText(f.id).then(function (t) {
+      var d = {}; try { d = JSON.parse(t) || {}; } catch (e) {}
+      return { fileId: f.id, trips: (Array.isArray(d.trips) ? d.trips : []).map(cleanTrip).filter(Boolean) };
+    });
+  });
+}
+/** Reads the latest trips file, changes it and writes it back (so a change on the phone and one on the PC both stay). */
+function changeTrips(fn) {
+  return root().then(function (r) {
+    return readTrips(r).then(function (cur) {
+      var trips = fn(cur.trips.slice()).map(cleanTrip).filter(Boolean);
+      trips.sort(function (a, b) { return a.start < b.start ? 1 : a.start > b.start ? -1 : 0; });
+      var text = JSON.stringify({ version: 1, updated: new Date().toISOString(), trips: trips }, null, 1);
+      var w = cur.fileId ? updateFile(cur.fileId, text, {}, null, 'application/json') : createFile(r, TRIPS_NAME, text, 'application/json');
+      return w.then(function () { return trips; });
+    });
+  });
+}
+
+var SUMMARY_RULES = 'You write a short summary of a trip from the entries of a personal journal. Write 3 to 5 sentences in the first person, ' +
+  'in the main language the entries are written in (keep local words like place or food names as they are), warm and plain. ' +
+  'Mention the places, people and highlights the entries describe, roughly in order. Never invent anything that is not in the entries. ' +
+  'No title, headings, lists, emoji or quotation marks. Reply with the summary only.';
+function tripText(trip, entries) {
+  var d0 = new Date(trip.start + 'T00:00'), out = '', left = 14000;
+  entries.slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; }).forEach(function (e) {
+    if (left <= 0) return;
+    var n = Math.round((new Date(e.date.slice(0, 10) + 'T00:00') - d0) / 864e5) + 1;
+    var part = '<entry day="' + n + '" date="' + e.date.slice(0, 10) + '">\n' + (e.title ? e.title + '\n' : '') + plainText(e.body).slice(0, 3000) + '\n</entry>\n';
+    out += part.slice(0, left); left -= part.length;
+  });
+  return 'Trip: ' + trip.name + ' (' + trip.start + ' to ' + trip.end + ')\n' + out;
 }
 
 /* ================================================================ */
@@ -835,11 +885,13 @@ function moveEarlier(onProg) {
 function bootRoot(r) {
   return readIndex(r).then(function (idx) { return idx || rebuildIndex(r); }).then(function (idx) {
     return Promise.all([settings().catch(function () { return { data: {} }; }),
+      readTrips(r).catch(function (e) { if (e.expired) throw e; return null; }),
       Auth.email ? null : dj(DRIVE + '/about?fields=user(emailAddress)').then(function (a) {
         Auth.email = a.user && a.user.emailAddress || ''; lsSet('diari-email', Auth.email);
       }).catch(function () {})
     ]).then(function (x) {
-      return { index: { entries: idx.entries }, rootUrl: 'https://drive.google.com/drive/folders/' + r, aiTitles: x[0].data.anthropicKey ? 'Claude' : '' };
+      return { index: { entries: idx.entries }, rootUrl: 'https://drive.google.com/drive/folders/' + r, aiTitles: x[0].data.anthropicKey ? 'Claude' : '',
+        trips: x[1] ? x[1].trips : null };
     });
   });
 }
@@ -1056,6 +1108,30 @@ window.DiariStore = {
   },
 
   /** Saves (or removes, with '') the Claude key after checking it with Claude. */
+  /** Trips: saveTrip adds or changes one (by id), deleteTrip removes one. Both resolve with the full, current list. */
+  saveTrip: function (t) {
+    var c = cleanTrip(t);
+    if (!c) return Promise.reject(new Error('A trip needs a name, a first day and a last day.'));
+    c.updated = new Date().toISOString(); if (!c.created) c.created = c.updated;
+    return changeTrips(function (list) { return list.filter(function (x) { return x.id !== c.id; }).concat([c]); });
+  },
+  deleteTrip: function (id) { return changeTrips(function (list) { return list.filter(function (x) { return x.id !== id; }); }); },
+  /** A short summary of the trip, written by Claude from its entries. */
+  tripSummary: function (trip, entries) {
+    return settings().then(function (s) {
+      var key = s.data.anthropicKey;
+      if (!key) throw new Error('Add your Claude key in Settings first.');
+      var model = s.data.claudeModel || 'claude-haiku-5-5';
+      return claudeCall(key, 'messages', { model: model, max_tokens: 500, thinking: { type: 'disabled' }, system: SUMMARY_RULES,
+        messages: [{ role: 'user', content: tripText(trip, entries) }] }).then(function (d) {
+        noteUse(model, d.usage);
+        var t = (d.content || []).filter(function (b) { return b.type === 'text'; }).map(function (b) { return b.text || ''; }).join('').trim();
+        if (!t) throw new Error('Claude did not write a summary. Try again.');
+        return t.slice(0, 3000);
+      });
+    });
+  },
+
   /** This month's Claude use on this device: { n: titles, usd, unpriced }. */
   claudeUse: claudeUse,
   /** True when Claude last said the credit has run out. */
@@ -1078,7 +1154,7 @@ window.DiariStore = {
 
   signOut: function () {
     resetCaches();
-    ['diari-index', 'diari-draft', 'diari-root', 'diari-email', 'diari-reopen'].forEach(lsDel);
+    ['diari-index', 'diari-draft', 'diari-root', 'diari-email', 'diari-reopen', 'diari-trips', 'diari-trip-folded'].forEach(lsDel);
     return Promise.all([Auth.signOut(), IDB.clear()]);
   }
 };

@@ -339,6 +339,51 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
 .loc-log li span{color:var(--muted)}
 .card{transition:background .6s ease}
 .card.justsaved{background:var(--accent-soft)}
+/* trips */
+.trip-head{display:flex;align-items:center;gap:12px;background:var(--mark-soft);border-radius:var(--r);padding:10px 6px 10px 12px;margin:10px 0 6px;cursor:pointer}
+.th-ico{width:36px;height:36px;border-radius:10px;background:var(--mark);color:var(--bg);display:grid;place-items:center;flex:none}
+.th-ico svg{width:20px;height:20px}
+.th-main{min-width:0;flex:1;display:flex;flex-direction:column}
+.th-main b{font:600 17px/1.25 var(--read);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.th-main span{font-size:12px;color:var(--muted);margin-top:2px}
+.th-fold{background:transparent!important;color:var(--ink)}
+.th-fold svg{transition:transform .2s}
+.trip-head.folded .th-fold svg{transform:rotate(-90deg)}
+.card.in-trip{box-shadow:inset 3px 0 0 var(--mark)}
+.day.trip{overflow:visible}
+.day.trip img,.day.trip.photo::after{border-radius:10px}
+.day .tband{position:absolute;left:0;right:-4px;bottom:3px;height:5px;background:var(--mark);z-index:3}
+.day .tband.s{left:5px;border-top-left-radius:3px;border-bottom-left-radius:3px}
+.day .tband.e{right:5px;border-top-right-radius:3px;border-bottom-right-radius:3px}
+.day.trip .dot{bottom:12px}
+.day.pick{outline:3px solid var(--mark);outline-offset:-2px;z-index:4}
+.pick-bar{display:flex;align-items:center;gap:10px;background:var(--mark-soft);border-radius:12px;padding:8px 6px 8px 14px;margin:0 0 10px;font-size:14px;line-height:1.4}
+.pick-bar span{flex:1}
+.trip-list{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 0}
+.trip-chip{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:999px;background:var(--mark-soft);color:var(--ink);padding:7px 12px;font:13px var(--ui);cursor:pointer;max-width:100%}
+.trip-chip svg{width:16px;height:16px;color:var(--mark);flex:none}
+.trip-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trip-chip.new{background:transparent;box-shadow:inset 0 0 0 1.5px var(--line);color:var(--muted);font-weight:700}
+.trip-chip.new svg{color:var(--muted)}
+.day-trip{border:0;background:var(--mark-soft);color:var(--ink);border-radius:999px;padding:3px 10px;font:600 12px var(--ui);margin-left:6px;vertical-align:middle;cursor:pointer}
+.trip-tag{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:999px;background:var(--mark-soft);color:var(--ink);padding:5px 12px;font:600 13px var(--ui);margin:10px 0 0;cursor:pointer}
+.trip-tag svg{width:15px;height:15px;color:var(--mark)}
+.trip-stats{color:var(--muted);margin:-8px 0 16px;font-size:14px}
+.trip-sum{background:var(--surface);border-radius:var(--r);padding:14px 16px 10px;margin:0 0 18px}
+.trip-sum p{font:400 16px/1.6 var(--read);margin:0 0 10px}
+.trip-h{font:600 19px var(--read);margin:26px 0 10px}
+.trip-day{font:700 12px var(--ui);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:22px 0 8px;display:flex;gap:8px;align-items:center}
+.trip-day span{background:var(--mark);color:var(--bg);border-radius:6px;padding:2px 7px;letter-spacing:.02em}
+.trip-entry{background:var(--surface);border-radius:var(--r);padding:12px 14px 2px;margin:0 0 8px;cursor:pointer}
+.te-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px}
+.te-head b{font:600 17px/1.3 var(--read)}
+.te-head span{font-size:12px;color:var(--muted);white-space:nowrap}
+.trip-entry .prose{font-size:16px}
+.trip-acts{display:flex;flex-wrap:wrap;gap:8px;margin:28px 0 0;padding-top:18px;border-top:1px solid var(--line)}
+.btn.danger-text{color:var(--danger)}
+.btn.small{height:36px;padding:0 12px;font-size:14px}
+.dlg-in{width:100%;height:46px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:0 12px;font:16px var(--ui);margin:0 0 16px}
+.dlg-in:focus{outline:2px solid var(--accent);outline-offset:1px}
 .plog{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface);border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;color:var(--muted);margin:10px 0 0}
 .ev-foot .pend{margin-left:auto}
 .key-row input{flex:1;min-width:0;height:42px;border-radius:12px;border:1px solid var(--line);background:var(--raised);padding:0 12px;font:inherit;font-size:15px;color:var(--ink)}
@@ -364,6 +409,13 @@ main{max-width:var(--col);margin:0 auto;padding:2px 16px calc(var(--nav) + 100px
   <button class="tab" data-view="media"><span data-ico="media"></span><span>Media</span></button>
 </div></nav>
 
+<section class="sheet" id="sheet-trip" aria-label="Trip">
+  <div class="sheet-bar">
+    <button class="icon-btn" data-act="close" aria-label="Back"></button>
+    <span class="spacer"></span>
+  </div>
+  <div class="sheet-body"><div class="sheet-in" id="trip-in"></div></div>
+</section>
 <section class="sheet" id="sheet-entry" aria-label="Entry">
   <div class="sheet-bar">
     <button class="icon-btn" data-act="close" aria-label="Back"></button>
