@@ -9,7 +9,7 @@ if (window.top !== window.self) { document.documentElement.innerHTML = ''; retur
 /* Setup                                                            */
 /* ================================================================ */
 var APP_NAME = 'Diari';
-var APP_VERSION = 'v25';
+var APP_VERSION = 'v26';
 var MEDIA_TAG = 'Journal attachment';
 var LIVE = true;
 var Store = window.DiariStore, Auth = Store.Auth;
@@ -2438,7 +2438,7 @@ function wireShell() {
     var mi = t.closest('[data-mi]'); if (mi) { openLightbox(allMedia(), +mi.getAttribute('data-mi'), true); return; }
     if (t.closest('[data-install]')) { Install.prompt(); return; }
     if (t.closest('[data-install-hide]')) { lsSet('diari-install-hidden', 1); render(); return; }
-    if (t.closest('[data-signin]')) { Auth.signIn(false); return; }
+    var si = t.closest('[data-signin]'); if (si) { signInTap(si); return; }
     if (t.closest('[data-move]')) { if (Auth.full && Auth.valid(10 * 60e3)) runMove(); else Auth.signIn(false, 'move'); return; }
     var fr = t.closest('[data-fresh]');
     if (fr) {
@@ -2510,14 +2510,45 @@ function runMove() {
   });
 }
 
-function showSignIn(msg) {
+function showSignIn(msg, note) {
   $('#fab').hidden = true;
   document.body.classList.add('signed-out');
   view.innerHTML = '<div class="signin">' + MARK +
     '<h2>Your journal, kept in your Google Drive</h2>' +
     '<p>Write about your day, add photos and videos, and find it all again by date, tag or word. Entries are saved as files in a Journal folder in your own Google Drive, and Diari can only see the files it creates there.</p>' +
     (msg ? '<p class="signin-err">' + esc(msg) + '</p>' : '') +
-    '<button class="btn primary" data-signin>Sign in with Google</button></div>';
+    (note ? '<p class="signin-note">' + esc(note) + '</p>' : '') +
+    '<button class="btn primary" data-signin>Sign in with Google</button>' +
+    '<div class="signin-help" id="signin-help" hidden></div>' +
+    '<p class="signin-note signin-last">' + esc(lastTry()) + '</p></div>';
+}
+
+/** One line about the last trip to Google, so a screenshot shows what happened. */
+function lastTry() {
+  var x = Auth.last();
+  if (!x || !x.at) return '';
+  var t = function (ms) { var d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  var line = 'Last sign-in: ' + (x.went === 'quiet' ? 'automatic' : 'tapped') + ' at ' + t(x.at);
+  if (!x.backAt || x.backAt < x.at) return line + ', no reply from Google yet. ' + APP_VERSION;
+  return line + ', Google replied “' + (x.back === 'ok' ? 'signed in' : x.back) + '”' + (x.stateOk === false ? ' (check failed)' : '') + ' at ' + t(x.backAt) + '. ' + APP_VERSION;
+}
+
+/** Tapping Sign in: show that it is working, and if Google does not open, offer another way. */
+function signInTap(b) {
+  var url;
+  try { url = Auth.authUrl(false); } catch (e) { fail(e); return; }
+  b.disabled = true; b.textContent = 'Opening Google…';
+  var t0 = Date.now();
+  setTimeout(function () {
+    if (document.hidden || !document.body.contains(b)) return;     // Google opened
+    b.disabled = false; b.textContent = 'Sign in with Google';
+    var h = $('#signin-help'); if (!h) return;
+    h.hidden = false;
+    h.innerHTML = '<p class="signin-err">Google did not open.</p>' +
+      '<p><a class="btn soft" href="' + esc(url) + '">Open the Google sign-in page</a></p>' +
+      '<p class="signin-note">Still stuck? Close Diari fully (swipe it away from recent apps) and open it again, or open <b>chinwaihoong.github.io/diari</b> in Chrome and sign in there. The app uses the same sign-in.</p>';
+  }, 6000);
+  try { location.assign(url); } catch (e) { location.href = url; }
 }
 
 function boot() {
@@ -2539,7 +2570,13 @@ function boot() {
     // Signed in before: get a new Google sign-in without any screens, then come straight back.
     if (Auth.email && !err) { view.innerHTML = '<p class="results" style="text-align:center;margin-top:40px">Signing in…</p>'; Auth.signIn(true); return; }
     // A quiet renewal did not work, but the current sign-in still has a few minutes: carry on with it.
-    if (!(Auth.silentFailed && Auth.valid(3 * 60e3))) { showSignIn(err in AUTH_ERRORS ? AUTH_ERRORS[err] : err); return; }
+    if (!(Auth.silentFailed && Auth.valid(3 * 60e3))) {
+      var known = err in AUTH_ERRORS ? AUTH_ERRORS[err] : err;
+      // A quiet renewal Google refused just means "sign in again"; after a tap, always say what Google answered.
+      if (err && !known) { if (Auth.silentFailed) showSignIn('', 'Google needs you to sign in again. Tap the button below.'); else showSignIn('Google did not finish signing you in (' + err + '). Tap Sign in to try again.'); }
+      else showSignIn(known);
+      return;
+    }
     keepGoing = true;
   }
   // Came back from allowing full Drive access: move the earlier journal now.

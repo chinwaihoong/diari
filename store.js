@@ -46,6 +46,8 @@ var Auth = {
     var h = location.hash.charAt(0) === '#' ? location.hash.slice(1) : '';
     if (!/(^|&)(access_token|error)=/.test(h)) return;
     var p = new URLSearchParams(h), pending = lsGet('diari-auth-state') || {};
+    var last = lsGet('diari-auth-last') || {};
+    lsSet('diari-auth-last', Object.assign(last, { back: p.get('error') || (p.get('access_token') ? 'ok' : '?'), backAt: Date.now(), stateOk: !!pending.state && p.get('state') === pending.state }));
     lsDel('diari-auth-state');
     history.replaceState(null, '', location.pathname + location.search);   // take the token out of the address
     if (!pending.state || p.get('state') !== pending.state || Date.now() - pending.at > 10 * 60e3) {
@@ -68,7 +70,8 @@ var Auth = {
 
   /** Leaves the app for Google's sign-in page and comes back. silent: no screens if already allowed.
       purpose 'move': asks for full Drive access, only to move an earlier journal in. */
-  signIn: function (silent, purpose) {
+  /** The Google sign-in address (and the check value it must come back with, kept on the device). */
+  authUrl: function (silent, purpose) {
     if (!CONFIG.clientId) throw new Error('The app is not set up yet: the Google client ID is missing in config.js.');
     var move = purpose === 'move';
     var state = rnd(16);
@@ -80,11 +83,20 @@ var Auth = {
       scope: move ? SCOPE_FULL : SCOPE_FILE,
       state: state
     };
-    if (silent && !move) q.prompt = 'none';
+    // Quiet renewal: no screens. Tapping Sign in: always show Google's page, so any problem there can be seen.
+    q.prompt = silent && !move ? 'none' : 'select_account';
     if (this.email) q.login_hint = this.email;
-    location.assign('https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams(q).toString());
+    lsSet('diari-auth-last', { at: Date.now(), went: silent && !move ? 'quiet' : 'tap' });
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams(q).toString();
+  },
+
+  signIn: function (silent, purpose) {
+    location.assign(this.authUrl(silent, purpose));
     return new Promise(function () {});        // the page is leaving
   },
+
+  /** What happened the last time Diari went to Google: { at, went, back: 'ok' | error code, backAt }. */
+  last: function () { return lsGet('diari-auth-last'); },
 
   /** Ends this sign-in and withdraws everything Diari was allowed to do in the Google account. */
   revoke: function () {
